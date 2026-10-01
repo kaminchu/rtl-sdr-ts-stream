@@ -1,10 +1,7 @@
 //! Streaming `u8` IQ → 188-byte TS receiver for the ISDB-T centre
 //! (partial-reception) segment.
 //!
-//! This is an original implementation written from scratch for this crate. No
-//! GNU Radio, `gr-isdbt`, Python or other existing demodulator source was
-//! consulted or copied. It wires the independently implemented demodulator
-//! primitives into one streaming pipeline:
+//! The demodulator primitives are wired into one streaming pipeline:
 //!
 //! ```text
 //! u8 IQ bytes

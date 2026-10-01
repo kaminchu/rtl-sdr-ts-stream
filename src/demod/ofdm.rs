@@ -1,8 +1,7 @@
 //! OFDM symbol extraction for the ISDB-T centre (partial-reception) segment.
 //!
-//! This is an original implementation written from scratch for this crate. The
-//! normative basis is ARIB STD-B31 version 2.2-E1 §3.14 (transmission spectrum
-//! configuration and guard-interval insertion):
+//! The normative basis is ARIB STD-B31 version 2.2-E1 §3.14 (transmission
+//! spectrum configuration and guard-interval insertion):
 //!
 //! * §3.14.1 defines the subcarrier spacing `1/Tu`, the carrier numbering `k`
 //!   (0 at the lowest frequency) and the centre carrier `Kc`
@@ -52,7 +51,7 @@
 //! ([`crate::demod::coarse::estimate_integer_cfo`]) without transforming the
 //! same symbol twice.
 //!
-//! # Not implemented
+//! # Out of scope
 //!
 //! Symbol/frame synchronisation, mode and guard estimation, channel estimation,
 //! equalisation and any `IQ -> TS` pipeline are deliberately *not* part of this

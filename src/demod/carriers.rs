@@ -1,9 +1,7 @@
 //! Centre-segment carrier recovery for ISDB-T: coherent channel estimation /
 //! equalisation and differential (DQPSK) demodulation.
 //!
-//! This is an original implementation written from scratch for this crate. No
-//! GNU Radio, `gr-isdbt`, Python or other existing demodulator source was
-//! consulted or copied. The normative basis is ARIB STD-B31 version 2.2-E1,
+//! The normative basis is ARIB STD-B31 version 2.2-E1,
 //! §3.12.1/Table 3-14 (differential OFDM-segment configuration), §3.12.2
 //! (coherent OFDM-segment configuration), §3.13.1 (scattered pilots),
 //! §3.9.3.1/Table 3-10 (`pi/4`-shift DQPSK) and §3.11.2.2 (intra-segment
@@ -43,7 +41,7 @@
 //! consecutive symbols, and the `96 / 192 / 384` results are frequency
 //! de-interleaved exactly as above.
 //!
-//! # Deliberately not implemented
+//! # Out of scope
 //!
 //! * Decision-directed refinement of the coherent channel estimate and any
 //!   differential amplitude/phase tracking beyond the unit-amplitude
@@ -51,9 +49,6 @@
 //! * TMCC decoding. The caller must already know whether the segment is
 //!   coherent or differential; no transmission parameters are read here.
 //! * Time/frequency *interleaving*; the de-interleaver is the final stage.
-//! * Real-signal validation. The behaviour is checked against synthetically
-//!   constructed flat/linear channels and DQPSK phase steps, not a recorded
-//!   signal.
 //!
 //! # Untrusted input
 //!

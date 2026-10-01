@@ -16,8 +16,10 @@ stream 配信することを目標とする Rust 製 CLI / サーバです。
 > RTL-SDR バックエンド（`rtl_backend::RtlReceiver`）に接続され、実信号でロック
 > すれば `GET /stream` は `200 video/mp2t` chunked を返します。旧版の README が
 > 書いていた「復調器未実装のため常に 503 `decoder not implemented`」は**誤りに
-> なりました**。ダミー TS を流す偽装はしません（`503` は現在、`librtlsdr` /
-> デバイス使用不可か、非対応サンプルレートのときだけです）。
+> なりました**。ダミー TS を流す偽装はしません。`503` は現在、`librtlsdr` /
+> デバイス使用不可、非対応サンプルレート / リサンプル設定、または開始時の内部
+> エラーで返ります。非対応サンプルレート / リサンプル設定の応答文字列は、後方
+> 互換で今も `decoder not implemented: ...` です。
 >
 > 実装方針は、ARIB STD-B31 v2.2-E1 の**一次資料を読んだ original 実装**です。
 > 隣接 PoC（GNU Radio / `gr-isdbt` / Python 等）のソースは参照・コピー・流用して
@@ -68,8 +70,8 @@ stream 配信することを目標とする Rust 製 CLI / サーバです。
 >   [`docs/stability.md`](docs/stability.md) §5.1。
 > - **DQPSK はコードとしては統合済み**（`carriers::differential_symbol` と
 >   `Decoder` の差動経路）ですが、**raw DQPSK の replay は未検証**です（replay
->   fixture は QPSK 同期変調のみ）。**DQPSK の SFO 補正は未検証**で、整数 CFO の
->   自動補正もありません（既知の ppm は呼び出し側が指定する想定）。
+>   fixture は QPSK 同期変調のみ）。**DQPSK の SFO 補正は未検証**で、**DQPSK の
+>   整数 CFO 自動補正もありません**（既知の ppm は呼び出し側が指定する想定）。
 > - **TMCC パリティは誤り訂正ではなく検査のみ**です。パリティ不一致のフレームは
 >   破棄し、取得からやり直します（reject / re-acquire）。
 > - **整数 CFO はコヒーレントセグメントで実装済み**です。粗探索を同期器に統合し、
@@ -166,7 +168,7 @@ stderr に出ます。
 | --- | --- |
 | `400 Bad Request` | `ch` が無い / 不正 / 未知のクエリ / 範囲外（現状は `13..=62` を受理） |
 | `409 Conflict` | 単一ストリーム枠が使用中（`tuning` / `locking` / `streaming` / `reacquiring` / `stopping`）。同一 ch・別 ch を問わない |
-| `503 Service Unavailable` | `librtlsdr` 不在 / デバイス使用不可、または非対応サンプルレート。**「復調器未実装」ではありません**（復調器は本番に接続済み） |
+| `503 Service Unavailable` | `librtlsdr` 不在 / デバイス使用不可、非対応サンプルレート / リサンプル設定、または開始時の内部エラー。**復調器は本番に接続済みで、常時 503 ではありません**（非対応サンプルレート / リサンプル設定のエラー文字列は今も `decoder not implemented:`） |
 | `504 Gateway Timeout` | 初期ロックが既定 10 秒でタイムアウト（実デバイスで信号がない場合を含む） |
 
 > `GET /stream` の `200 video/mp2t` chunked 応答は、テスト限定モックと、合成
@@ -299,14 +301,14 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 - release 品質ゲートは **241 passed / 0 failed / 1 ignored**（2026-10-01 実測）。
   長時間 ignore テストを明示実行すると **1 passed**。
 - **DQPSK はコード統合済みだが、raw DQPSK replay は未検証**（fixture は QPSK）。
-  整数 CFO の自動補正と SFO 補正も未対応・未検証。
+  **DQPSK の**整数 CFO 自動補正と SFO 補正も未対応・未検証。
 - **TMCC パリティは検査のみで誤り訂正なし**。不一致フレームは破棄して再取得する。
 - **整数 CFO はコヒーレントセグメントで実装済み**（粗探索の連続確認後に補正）。
 - **SFO 累積 de-ramp は TMCC / DQPSK 用に維持**し、コヒーレント SP 等化の前に
   巻き戻す。シンボル履歴は 1 フレーム分を厳密に検証する。
 - 本番 `/stream` はロック時に `200 video/mp2t` を返す。`503` は `librtlsdr` /
-  デバイス不可か非対応サンプルレートのときのみ。無信号は既定 10 秒で `504`。
-  ダミー TS は流さない。
+  デバイス不可、非対応サンプルレート / リサンプル設定、または開始時の内部エラーの
+  ときのみ。無信号は既定 10 秒で `504`。ダミー TS は流さない。
 - SIMD 最適化（AVX2 / NEON）は IQ 正規化のみ。**性能測定は未実施**。
 - N100 実機受入は**部分**。2026-10-01 10:04 JST の live 2 回（25 s / 15 s）は
   CP 同期して `200 video/mp2t` を返し TS を出力（[`docs/hardware-n100.md`](docs/hardware-n100.md)

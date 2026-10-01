@@ -1,8 +1,7 @@
 //! OFDM-frame acquisition and TMCC validation for the ISDB-T centre
 //! (partial-reception) segment.
 //!
-//! This is an original implementation written from scratch for this crate. The
-//! normative basis is ARIB STD-B31 version 2.2-E1:
+//! The normative basis is ARIB STD-B31 version 2.2-E1:
 //!
 //! * §3.15.2 / Table 3-20 — the 204-bit TMCC assignment `B0..B203`: `B0` is the
 //!   differential reference, `B1..B16` the frame synchronising word, `B17..B19`
@@ -53,7 +52,7 @@
 //! carrier modulation (Table 3-1: DQPSK requires `Differential`, QPSK/16QAM/64QAM
 //! require `Coherent`); an inconsistent pair is never reported as a frame.
 //!
-//! # What this module does not do
+//! # Out of scope
 //!
 //! * Equalisation / channel estimation ([`crate::demod::carriers`]).
 //! * Time, frequency, bit or byte de-interleaving.
@@ -62,9 +61,6 @@
 //! * Any `IQ -> TS` pipeline. This module only turns a stream of centre-segment
 //!   carrier symbols into validated, aligned OFDM frames; it never claims to
 //!   decode payload data.
-//! * Real-signal validation. The behaviour is checked against synthetically
-//!   constructed DBPSK frames derived from [`crate::demod::control::tmcc_encode`]
-//!   and the pilot PRBS reference of §3.13.1, not a recorded signal.
 //!
 //! # Bounds and untrusted input
 //!

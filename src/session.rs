@@ -175,7 +175,8 @@ pub enum BackendError {
     /// The device/library could not be used.
     #[error("device unavailable: {0}")]
     Unavailable(String),
-    /// The device works, but no IQ->TS decoder is wired in.
+    /// The requested receiver configuration is not supported (for example a
+    /// rejected sample rate, resampling ratio, or modulation).
     #[error("decoder not implemented: {0}")]
     DecoderUnsupported(String),
     /// Unrecoverable receiver error.

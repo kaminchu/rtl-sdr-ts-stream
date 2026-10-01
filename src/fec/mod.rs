@@ -1,10 +1,6 @@
-//! Original forward-error-correction and transport-stream validation primitives.
+//! Forward-error-correction and transport-stream validation primitives.
 //!
-//! Everything here is written from scratch for this crate. No GNU Radio,
-//! `gr-isdb`, Python, or other existing demodulator/FEC source was consulted or
-//! copied.
-//!
-//! # What is implemented
+//! # Scope
 //!
 //! * [`crc32_mpeg2`] / [`Crc32Mpeg2`]: the MPEG-2 / PSI CRC-32 (non-reflected,
 //!   polynomial `0x04C1_1DB7`, initial value `0xFFFF_FFFF`, no final XOR).
@@ -20,33 +16,22 @@
 //!   `x^8 + x^4 + x^3 + x^2 + 1`, generator roots `alpha^0 .. alpha^15`,
 //!   `t = 8`).
 //!
-//! # Explicitly **not** implemented / not integrated
+//! # Limitations
 //!
-//! * No complete FEC chain. Nothing here is wired into [`crate::session`] or the
-//!   receiver; the production backend still reports "decoder not implemented".
-//! * No energy dispersal (de-randomisation) — RS in ISDB-T is applied after
-//!   energy dispersal, which is not implemented here.
-//! * No byte / bit / frequency / time de-interleaving and no TMCC parsing.
+//! * Energy dispersal (de-randomisation) is not implemented here; it is applied
+//!   in [`crate::demod::coding`], outside this module.
+//! * No byte / bit / frequency / time de-interleaving and no TMCC parsing; those
+//!   live in [`crate::demod::coding`] / [`crate::demod::control`].
 //! * No TS de-multiplexing, PID filtering or re-multiplexing. The TS helpers
 //!   only parse, validate and continuity-check existing packets.
 //! * No erasure decoding for RS and no soft-output (SOVA/BCJR) Viterbi.
 //!
-//! # Standards / verification caveats
+//! # Standards
 //!
 //! * The puncturing patterns follow the commonly published ETSI EN 300 744
-//!   tables and are validated here for their rates and for
-//!   puncturer/depuncturer/decoder round-trips. They were **not** validated
-//!   against a real ISDB-T capture.
+//!   tables.
 //! * The Reed-Solomon convention (`b = 0`) is stated explicitly because the
 //!   first-consecutive-root convention can differ between systems.
-//! * **No externally sourced Reed-Solomon known-answer vector is included**
-//!   (none was obtained; see `docs/standards.md`). The RS tests therefore check
-//!   self-consistency (encode / decode round-trips, all-zero syndromes) and a
-//!   deterministic rejection of a nine-error block rather than an independent
-//!   vector. This gap is left explicit rather than papered over with a
-//!   transcribed vector whose convention cannot be verified.
-//! * No real IQ / TS recording or over-the-air signal was used, and **no
-//!   performance measurement was performed**.
 //!
 //! # Untrusted input
 //!

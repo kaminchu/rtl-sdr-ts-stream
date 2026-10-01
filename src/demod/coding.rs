@@ -1,10 +1,8 @@
 //! ISDB-T channel-coding (receiver) for the centre (partial-reception) segment.
 //!
-//! Everything here is written from scratch for this crate. No GNU Radio,
-//! `gr-isdbt`, Python or other existing demodulator/decoder source was consulted
-//! or copied. The normative behaviour is transcribed from ARIB STD-B31 English
-//! translation, version 2.2-E1 (the primary source used by this project; see
-//! `docs/standards.md`). Printed page numbers below refer to that document.
+//! The normative behaviour is transcribed from ARIB STD-B31 English
+//! translation, version 2.2-E1. Printed page numbers below refer to that
+//! document.
 //!
 //! # Receiver chain owned by this module
 //!

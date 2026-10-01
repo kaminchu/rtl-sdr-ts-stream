@@ -11,7 +11,10 @@
 //!   channel outside `13..=62`.
 //! * `409` the single stream slot is reserved (`tuning`/`locking`/`streaming`/
 //!   `reacquiring`/`stopping`), regardless of requested channel.
-//! * `503` device/library unavailable, or "decoder not implemented".
+//! * `503` device/library unavailable, an unsupported receiver configuration
+//!   (rejected sample rate / resampling), or an internal start failure. The
+//!   response body still uses the legacy `decoder not implemented:` prefix for
+//!   the rejected-configuration case.
 //! * `504` the initial lock deadline expired.
 //!
 //! A successful response carries `Content-Type: video/mp2t` and a streaming body

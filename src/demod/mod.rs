@@ -1,6 +1,6 @@
 //! ISDB-T demodulator/decoder building blocks.
 //!
-//! This module owns the from-scratch ISDB-T receiver primitives:
+//! This module owns the ISDB-T receiver primitives:
 //!
 //! * [`coding`] — channel coding (bit de-interleaving, depuncturing, Viterbi,
 //!   byte de-interleaving, energy-dispersal removal, RS(204,188) decoding).

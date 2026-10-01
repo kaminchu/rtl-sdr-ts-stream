@@ -58,10 +58,12 @@ cargo test --release --lib demod::replay_tests -- --test-threads=1
 - Debug profile の full suite は再実行していない。**Debug での全成功は主張しない。**
 - `cargo check --target aarch64-unknown-linux-gnu --lib`: 成功を観測。ただし
   **コンパイル確認のみ**で実行時検証ではない。ARM 実機上での実行は未実施。
-- 実機（N100）では USB 受信・HTTP の再試験を実施。1 回の HTTP `200` は過去に観測
-  したが、現在の live は `504`。録画 IQ 3 秒（7200000 byte）は
-  **608 TS / 114304 byte** まで decode 済み
-  （[`hardware-n100.md`](hardware-n100.md) §2–§4、[`stability.md`](stability.md) §5）。
+- 実機（N100）では USB 受信・HTTP の再試験を実施。2026-10-01 10:04 JST の live
+  2 回（25 s / 15 s、ch19 / auto gain / ppm 0）は CP 同期して `200 video/mp2t` を
+  返し、TS を出力（attempt 1: 6426 TS / 1208088 byte、attempt 2: 3742 TS /
+  703496 byte）。以前の live `504` と録画 IQ 3 秒（7200000 byte）の
+  **608 TS / 114304 byte** は履歴として保持
+  （[`hardware-n100.md`](hardware-n100.md) §2–§4・§10、[`stability.md`](stability.md) §5）。
 
 この受入が検証する範囲:
 
@@ -88,8 +90,10 @@ cargo test --release --lib demod::replay_tests -- --test-threads=1
 - **raw DQPSK replay は未検証**（fixture は QPSK 同期変調のみ）。DQPSK のコードは
   統合済みだが、raw 経路での確認は残る。
 - 実機の実時間性能 / CPU / RSS / 30 分連続は未測定。
-- 実機経路での `200 video/mp2t` は過去に 1 回観測したのみで、現在の live は `504`。
-  安定した連続配信は未検証（主な検証はモックと合成 replay）。
+- 実機経路での `200 video/mp2t` は 2026-10-01 10:04 JST の live 2 回（25 s / 15 s）
+  で観測した。以前の再試験では live `504` も観測しており
+  （[`hardware-n100.md`](hardware-n100.md) §2・§4）、30 分連続など安定した連続
+  配信は未検証（主な検証はモックと合成 replay）。
 
 判定: 上記が現状の合成受入。release full suite は
 **241 passed / 0 failed / 1 ignored**、明示実行した長時間 ignore テストは
@@ -125,15 +129,20 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 - `list-devices`: 実デバイスが 1 行以上（`index=... name=... serial=...`）。
 - `/version`: `200` JSON（例 `{"name":"ts-stream","version":"0.1.0"}`）。
 - `/stream`: 復調器は本番に接続済みなので、実信号でロックすれば
-  `200 video/mp2t` chunked を返す。**実機での `200` は過去に 1 回観測したのみで、
-  現在の live は CP 同期できず `504` である（安定配信は未確認）。**
+  `200 video/mp2t` chunked を返す。**2026-10-01 10:04 JST の live 2 回
+  （25 s / 15 s、ch19 / auto gain / ppm 0）は CP 同期して `200` と TS を返した
+  （attempt 1: 6426 TS / 1208088 byte、attempt 2: 3742 TS / 703496 byte）。**
+  以前の再試験では CP 同期できず `504` も観測しており、この `504` は履歴として
+  保持する。
   - 信号が無い / ロックできない場合は、既定 10 秒の初期ロック期限後に
     `504 Gateway Timeout` を返す（`503 decoder not implemented` ではない）。
-  - `503 Service Unavailable` は `librtlsdr` / デバイス使用不可か、非対応
-    サンプルレートのときのみ。
-- 本受入は**未合格**である。N100 で実機試験を実施したが CP 同期できず長時間安定
-  受信は未達。ARM 実機（OrangePi PC2）は未実施
-  （[`hardware-n100.md`](hardware-n100.md) §4、[`stability.md`](stability.md) §5）。
+  - `503 Service Unavailable` は `librtlsdr` / デバイス使用不可、非対応
+    サンプルレート / リサンプル設定、または開始時の内部エラーのときのみ。
+    非対応サンプルレート / リサンプル設定のエラー文字列は後方互換で
+    `decoder not implemented:` を含む。
+- 本受入は**未合格**である。N100 で live 2 回（25 s / 15 s）の `200` を観測したが、
+  30 分連続・長時間安定受信は未達。ARM 実機（OrangePi PC2）は未実施
+  （[`hardware-n100.md`](hardware-n100.md) §4・§10、[`stability.md`](stability.md) §5）。
 
 判定: 合否は「エラーコードを返したか」ではなく「**正しい 188 byte TS が得られたか**」
 で判定する。現時点で実機の合格記録は無い。
@@ -152,8 +161,9 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 ## 4. C. 最終目標の受入（recorded RF / N100 は未達）
 
 以下は**未達**です。合成 replay のソフトウェアパイプラインは存在し、N100 の 3 秒
-録画 IQ から **608 TS / 114304 byte** を一度 decode し、実機 HTTP `200` も 1 回
-観測しましたが、**安定した録画 RF・実機での合格はまだ記録されていません。**
+録画 IQ から **608 TS / 114304 byte** を一度 decode し、実機 HTTP `200` も
+2026-10-01 10:04 JST の live 2 回（25 s / 15 s）で観測しましたが、**安定した
+録画 RF・実機での合格はまだ記録されていません。**
 測定条件と生値を記録せずに「達成」と書かないこと。
 
 - 既知ベクトル / 合法な録画 IQ（自作録画、配布権利確認済み）から正しい

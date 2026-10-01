@@ -1,9 +1,7 @@
 //! Streaming OFDM synchroniser for the ISDB-T centre (partial-reception)
 //! segment.
 //!
-//! This is an original implementation written from scratch for this crate; no
-//! proof-of-concept or third-party demodulator source was consulted. The
-//! normative basis is ARIB STD-B31 version 2.2-E1:
+//! The normative basis is ARIB STD-B31 version 2.2-E1:
 //!
 //! * §3.14.1 / Table 3-1 — the three transmission modes (effective symbol
 //!   lengths `252 / 504 / 1008 us`, i.e. `256 / 512 / 1024` samples at the

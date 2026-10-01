@@ -1,11 +1,8 @@
-//! Original, reusable front-end DSP primitives.
+//! Reusable front-end DSP primitives.
 //!
-//! Everything here is written from scratch for this crate. No GNU Radio,
-//! `gr-isdb`, Python, or other existing demodulator source was consulted or
-//! copied. The only external DSP dependency is [`rustfft`], used for the FFT as
-//! permitted by the project plan ("FFT ... reuse a mature library").
+//! The only external DSP dependency is [`rustfft`], used for the FFT.
 //!
-//! # What is implemented
+//! # Scope
 //!
 //! * [`normalize_u8_iq`] / [`normalize_u8_iq_into`]: convert librtlsdr's
 //!   interleaved unsigned 8-bit IQ stream into normalised [`Complex32`] in
@@ -20,30 +17,21 @@
 //!   `(fft_size, guard_len)` and a best-offset search helper.
 //! * [`Fft`]: a thin validated wrapper over `rustfft`.
 //!
-//! # Explicitly **not** implemented / not integrated
+//! # Out of scope
 //!
-//! These are deliberately out of scope for this module. Nothing here claims a
-//! working receiver, and none of the following is stubbed as if it worked:
+//! These responsibilities live in other modules:
 //!
 //! * TMCC decoding (hierarchical modulation / coding / time-interleaving
-//!   parameters).
-//! * Channel estimation and equalisation.
-//! * Frequency, time, symbol or bit de-interleaving.
-//! * Puncturing / Viterbi / Reed-Solomon / TS framing (see [`crate::fec`] for
-//!   the parts that *are* implemented, which are still not wired together).
-//! * Any `IQ -> TS` receiver or full demodulation pipeline. The production
-//!   backend still reports "decoder not implemented".
-//! * Mode / guard-interval *estimation* from a live signal. The parameter types
-//!   exist; choosing them from samples is not implemented.
-//!
-//! # Verification status
-//!
-//! All primitives are unit-tested against independently constructed expected
-//! values and against each other (scalar vs SIMD, chunked vs contiguous,
-//! polyphase vs a naive `f64` reference). No real IQ recording, over-the-air
-//! signal, or hardware run was used, and **no performance measurement was
-//! performed**. SIMD is present but "not measured"; it is validated only for
-//! numerical equivalence with the scalar path.
+//!   parameters): in [`crate::demod::control`] and [`crate::demod::frame`].
+//! * Channel estimation and equalisation: in [`crate::demod::carriers`].
+//! * Frequency, time, symbol or bit de-interleaving: in
+//!   [`crate::demod::control`] / [`crate::demod::coding`].
+//! * Puncturing / Viterbi / Reed-Solomon / TS framing: in [`crate::fec`], driven
+//!   by [`crate::demod::coding`].
+//! * Any `IQ -> TS` receiver or full demodulation pipeline: in
+//!   [`crate::demod::receiver`].
+//! * Mode / guard-interval *estimation* from a live signal: in
+//!   [`crate::demod::sync`]; this module only defines the parameter types.
 //!
 //! # Untrusted input
 //!

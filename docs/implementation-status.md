@@ -18,14 +18,18 @@ chunked で配信する」は、**ソフトウェア経路として本番に接�
   本番の `GET /stream?ch=NN` は実信号でロックすれば `200 video/mp2t` chunked を
   返します。**旧版の「復調器未接続のため常に 503 `decoder not implemented`」は
   誤りになりました。**
-- `503` は現在、`librtlsdr` / デバイス使用不可か、非対応サンプルレートのときだけ
-  です。実デバイスでロックできない場合は **既定 10 秒で `504`** になります
-  （モックの空 receiver = `NoSignal` のみ、で検証）。
+- `503` は現在、`librtlsdr` / デバイス使用不可、非対応サンプルレート / リサンプル
+  設定、または開始時の内部エラーのときだけです。実デバイスでロックできない場合は
+  **既定 10 秒で `504`** になります（モックの空 receiver = `NoSignal` のみ、で
+  検証）。
 - 実装は ARIB STD-B31 v2.2-E1 の一次資料を読んだ **original 実装**です。隣接 PoC
   （GNU Radio / `gr-isdbt` / Python 等）のソースは参照・コピー・流用していません。
-- **検証は現時点ですべて合成（synthetic）です。** 送信機を本リポジトリ内に自作し、
-  その IQ を replay しています。**独立した録画 RF 信号の fixture は存在しません。**
-  実機性能は未測定です。
+- **自動テストと合成 replay は現時点ですべて合成（synthetic）です。** 送信機を本
+  リポジトリ内に自作し、その IQ を replay しています。**独立した録画 RF 信号の
+  fixture は存在しません。** 一方、N100 実機の録画 IQ replay と 2026-10-01 の
+  短時間 live は別途観測済みです（[`hardware-n100.md`](hardware-n100.md)、
+  [`stability.md`](stability.md) §5）。これらは独立 fixture ではなく部分観測で、
+  実機性能・受入完了の証明ではありません。
 - 2026-10-01 の安定性修正と品質ゲート再実行で、release full suite は
   **241 passed / 0 failed / 1 ignored**、明示実行の長時間 ignore テストは
   **1 passed** です（§1）。旧版の raw IQ replay 失敗（TMCC 4 / TS 179）と
@@ -56,7 +60,7 @@ chunked で配信する」は、**ソフトウェア経路として本番に接�
   別途 N100 実機 run を実施（当時の部分記録は
   [`hardware-n100.md`](hardware-n100.md)、現在の観測は
   [`stability.md`](stability.md) §5）。
-- OrangePi PC2 と実 IQ を用いた受入は未実施。
+- OrangePi PC2 の実機受入と、独立 fixture の実 IQ を用いた受入は未実施。
 - 上記は `src/lib.rs` が公開する全モジュール（`dsp` / `fec` / `rtl` / `demod` /
   `http` / `session` / `cli`）を対象にビルド・テストされます。`demod` は
   `src/lib.rs` から公開され、本番バックエンドに接続済みです。
@@ -66,10 +70,10 @@ chunked で配信する」は、**ソフトウェア経路として本番に接�
 | Phase | 計画の完了条件（要約） | 実装・観測 | 判定 |
 | --- | --- | --- | --- |
 | 0 一次資料・ライセンス・規格対応表 | Phase 1 着手に必要な契約が確定。調査未了は明記 | `docs/standards.md`・`docs/license.md` 作成済み。**S1 は `pdftotext` 抽出に成功**し、§3.3–3.15 の数値パラメータを `[本文確認]` として転記。BT.1306/2016 本文との突き合わせは `[未検証]` | **部分**（主要規格値は確認済み。ITU 本文の突き合わせは残） |
-| 1 crate 骨格・CLI/API 契約・モック | `fmt/check/test/clippy` 全通過、`/version` JSON、モックの chunked TS、本番にモックを出さない | crate・CLI・`/version`・`/stream` 契約・テスト限定モックを実装 | **機能条件達成**（品質ゲートは replay 修正待ちで未確定） |
-| 2 N100 実機受信 / IQ | `list-devices` が実デバイスを列挙。IQ replay で後段へ供給。N100 で継続受信。対応表検証 | `src/rtl.rs` に `dlopen`・列挙・open/チューニング・非同期 IQ・有界 queue・gap 検出・cancel/join・close-after-join を実装。**実機受入は未実施**。IQ replay は合成 fixture のみ | **部分** |
-| 3 scalar DSP / FEC TS PoC | 既知ベクトル / 録画 IQ から正しい TS（CRC・continuity 含む）を再現 | **IQ→TS ソフトウェアパイプラインを実装し本番に接続**。キャリア推定・等化・DQPSK・各種デインタリーブ・エネルギー拡散除去・Viterbi・RS を統合。**合成 replay で検証**。**録画 RF / 既知ベクトルは未入手・未実施**。raw replay は解消（現在 release full suite 241/0/1） | **部分**（software pipeline は存在。recorded RF / N100 は未達） |
-| 4 単一 HTTP 統合 | 実デバイスからの chunked TS 配信、排他・切断・エラー、リソース解放 | 状態機械・原子的予約・409・reacquiring・有界 queue・遅読切断・`/version` 全状態応答・join 後解放・shutdown をモックで検証。**実デバイスからの TS 配信は未検証**（実機受入待ち） | **部分**（HTTP 層とバックエンド接続は実装済み） |
+| 1 crate 骨格・CLI/API 契約・モック | `fmt/check/test/clippy` 全通過、`/version` JSON、モックの chunked TS、本番にモックを出さない | crate・CLI・`/version`・`/stream` 契約・テスト限定モックを実装 | **機能条件達成**（品質ゲートは §1 のとおり全通過） |
+| 2 N100 実機受信 / IQ | `list-devices` が実デバイスを列挙。IQ replay で後段へ供給。N100 で継続受信。対応表検証 | `src/rtl.rs` に `dlopen`・列挙・open/チューニング・非同期 IQ・有界 queue・gap 検出・cancel/join・close-after-join を実装。N100 実機では列挙・受信・録画 IQ replay と短時間 live を観測したが、**30 分連続の実機受入は未実施**。リポジトリ内 IQ replay は合成 fixture のみ | **部分** |
+| 3 scalar DSP / FEC TS PoC | 既知ベクトル / 録画 IQ から正しい TS（CRC・continuity 含む）を再現 | **IQ→TS ソフトウェアパイプラインを実装し本番に接続**。キャリア推定・等化・DQPSK・各種デインタリーブ・エネルギー拡散除去・Viterbi・RS を統合。**合成 replay で検証**。N100 の録画 IQ（リポジトリ外）replay と短時間 live は部分観測済みだが、**独立 fixture 化された録画 RF / 既知ベクトルは未整備・未実施**。raw replay は解消（現在 release full suite 241/0/1） | **部分**（software pipeline は存在。recorded RF / N100 は未達） |
+| 4 単一 HTTP 統合 | 実デバイスからの chunked TS 配信、排他・切断・エラー、リソース解放 | 状態機械・原子的予約・409・reacquiring・有界 queue・遅読切断・`/version` 全状態応答・join 後解放・shutdown をモックで検証。N100 では 2026-10-01 の短時間 live で `200 video/mp2t` と TS を観測したが、**30 分連続など実デバイスからの安定配信は未検証** | **部分**（HTTP 層とバックエンド接続は実装済み） |
 | 5 N100 SIMD（AVX2）と長時間受入 | N100 で実時間処理を実測。30 分連続。CPU/RSS/遅延測定 | IQ 正規化に AVX2 と scalar 一致テストのみ。**ホットスポット特定・最適化・性能測定・長時間は未実施** | **未達** |
 | 6 arm64 NEON と OrangePi PC2 | N100 と OrangePi PC2 の両実機で実時間処理 | NEON 正規化コードと aarch64 `check --lib` 成功のみ。**OrangePi 実機・NEON 実行検証は未実施** | **未達** |
 | 7 安定化・配布・文書 | 目標時間の連続処理で取りこぼし・メモリ増・ハンドル漏れなし | README・`LICENSE`・`docs/*` を整備。セッションの join/停止/シャットダウンを強化。**長時間安定性・配布物は未確認。USB stuck 時の無期限 cleanup が既知の残課題** | **部分** |
@@ -157,15 +161,16 @@ TS -> RS(204,188) -> フレーム単位エネルギー拡散 -> バイトイン�
   [`stability.md`](stability.md)）。
 - **DQPSK はコードとしては統合済み**（`carriers::differential_symbol` と
   `Decoder` の差動経路、`frame.rs` の差動 predecessor 追跡）ですが、**raw DQPSK
-  の replay は未検証**で、**SFO 補正と整数 CFO の自動補正も未対応**です。replay
-  fixture は QPSK 同期変調のみです。
+  の replay は未検証**で、**DQPSK の SFO 補正と整数 CFO 自動補正も未対応**です。
+  コヒーレントセグメントの整数 CFO は実装済みです（§3.1）。replay fixture は
+  QPSK 同期変調のみです。
 
 ## 5. 未実装 / 未検証（残作業の一覧）
 
 | 項目 | 状態 |
 | --- | --- |
-| 独立した録画 RF / 既知受信ベクトルによる検証（CRC・continuity 含む） | 未入手・未実施 |
-| 実機（N100 / OrangePi PC2）での受信・実時間処理 | 未実施 |
+| 独立した録画 RF / 既知受信ベクトルによる検証（CRC・continuity 含む） | N100 の録画 IQ（リポジトリ外）と短時間 live の部分観測のみ。**独立 fixture / 既知受信ベクトルは未入手・未実施** |
+| 実機（N100 / OrangePi PC2）での受信・実時間処理 | N100 は SHORT live 2 回（2026-10-01、[`stability.md`](stability.md) §5.1 / [`hardware-n100.md`](hardware-n100.md) §10）を観測。OrangePi / 30 分・実時間は未実施 |
 | 性能測定・30 分連続・AVX2 ホットスポット最適化 | 未測定 |
 | OrangePi PC2 実機 / NEON 実行検証 | 未実施 |
 | raw IQ replay の TMCC 検証数不足（旧版で 4、期待 5） | 解消（現在 release full suite 241/0/1） |
@@ -174,7 +179,7 @@ TS -> RS(204,188) -> フレーム単位エネルギー拡散 -> バイトイン�
 | DQPSK の整数 CFO 自動補正 | 未対応（SP が無いため。既知 ppm は呼び出し側） |
 | SFO 累積 de-ramp とコヒーレント等化の整合 | 実装済み（1 フレームのシンボル履歴を厳密検証） |
 | TMCC パリティの誤り訂正 | 未実装（検査のみ。不一致は破棄して再取得） |
-| 実デバイス経路での `200 video/mp2t` | 未検証（モックと合成 replay のみ） |
+| 実デバイス経路での `200 video/mp2t` | 2026-10-01 10:04 JST の live 2 回（25 s / 15 s）で観測。30 分連続は未検証 |
 | 実デバイス無信号時の `504` | モック（空 receiver）で検証。実機は未実施 |
 | 中心周波数受理範囲 `13..62` と現行 `13..52` の整合 | 未解決（後方互換のため `13..=62` を維持） |
 
@@ -202,10 +207,10 @@ TS -> RS(204,188) -> フレーム単位エネルギー拡散 -> バイトイン�
   `cargo check --target aarch64-unknown-linux-gnu --lib` の成功を観測しました。
   **コンパイル確認であり、実機実行・NEON 実行検証の証明ではありません。**
 - **N100 実機の受信記録は別紙 [`hardware-n100.md`](hardware-n100.md) に分離**
-  （2026-09-30 JST、観測記録）。real IQ decode と 1 回の HTTP `200` を観測したが、
-  再現安定・30 分連続・OrangePi PC2 は未達。**受入完了ではない。**
-  現在（2026-10-01）の安定性・品質ゲート・実機観測は
-  [`stability.md`](stability.md) §5–§6 を参照。
+  （2026-09-30 JST、観測記録）。当時 real IQ decode と 1 回の HTTP `200` を観測
+  したが、再現安定・30 分連続・OrangePi PC2 は未達。**受入完了ではない。**
+  現在（2026-10-01）は短時間 live 2 回（25 s / 15 s）の `200` を観測しており、
+  安定性・品質ゲート・実機観測は [`stability.md`](stability.md) §5–§6 を参照。
 - OrangePi PC2 の実機受入は未実施。N100 では RTL-SDR の列挙・open・
   autodetach/reattach を確認（`hardware-n100.md`）。
 - `librtlsdr` はビルド時にリンクせず、実行時に `dlopen` します。実機では udev /

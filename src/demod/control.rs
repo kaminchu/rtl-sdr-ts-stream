@@ -1,12 +1,9 @@
 //! ISDB-T OFDM control-plane primitives for the centre (partial-reception)
 //! segment.
 //!
-//! Everything here is written from scratch for this crate. No GNU Radio,
-//! `gr-isdbt`, Python or other existing demodulator source was consulted or
-//! copied. The normative values are transcribed from the ARIB STD-B31 English
-//! translation, version 2.2-E1 (the primary source used by this project; see
-//! `docs/standards.md`). Every table below carries the section/table number it
-//! came from.
+//! The normative values are transcribed from the ARIB STD-B31 English
+//! translation, version 2.2-E1. Every table below carries the section/table
+//! number it came from.
 //!
 //! # Scope
 //!
@@ -35,15 +32,12 @@
 //!   check, current/next information parsing and the current layer-A
 //!   transmission parameters.
 //!
-//! # Not implemented
+//! # Out of scope
 //!
 //! * Inter-segment frequency interleaving (§3.11.2.1) and the 13-segment
 //!   layout beyond the absolute/local index helpers.
 //! * AC (Auxiliary Channel) payload decoding, byte/bit interleaving, energy
 //!   dispersal, Viterbi and RS — those live outside this module.
-//! * Any over-the-air validation. The values here are checked against the
-//!   normative tables and against independently constructed reference code,
-//!   not against a recorded signal.
 //!
 //! # Untrusted input
 //!

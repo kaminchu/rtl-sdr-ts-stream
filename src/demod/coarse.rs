@@ -1,12 +1,10 @@
 //! Coarse (integer-subcarrier) carrier-frequency-offset estimation for the
 //! coherent ISDB-T centre (partial-reception) segment.
 //!
-//! This is an original implementation written from scratch for this crate. The
-//! normative basis is ARIB STD-B31 version 2.2-E1 §3.12.2 and Fig. 3-30
+//! The normative basis is ARIB STD-B31 version 2.2-E1 §3.12.2 and Fig. 3-30
 //! (scattered pilots: one carrier every 12, one of four residues per OFDM
 //! symbol) and §3.13.1/Table 3-16/Table 3-17 (the BPSK pilot PRBS reference
-//! `W_i` and its `+-4/3` signal points). No GNU Radio, `gr-isdbt`, Python or
-//! other existing demodulator source was consulted or copied.
+//! `W_i` and its `+-4/3` signal points).
 //!
 //! # What this module does
 //!
@@ -63,7 +61,7 @@
 //! condition holds — silence, an all-zero spectrum, random data, a burst that is
 //! not a coherent one-segment symbol — `None` is returned rather than a guess.
 //!
-//! # Applying the estimate (not integrated with `sync` yet)
+//! # Applying the estimate
 //!
 //! Let `C = carriers_per_segment(mode)` and `N = segment_fft_size(mode)`. Once
 //! `estimate = estimate_integer_cfo(...)` is `Some`, carrier extraction is the
@@ -87,7 +85,7 @@
 //! pilot common-phase estimate. Integer correction and common-phase correction
 //! are two separate steps.
 //!
-//! # Scope and honesty
+//! # Limitations
 //!
 //! This estimator only works for a **coherent** segment with scattered pilots
 //! (QPSK/16QAM/64QAM layer A). A differential (DQPSK) segment carries no
@@ -95,8 +93,7 @@
 //! returns `None` in practice: coarse CFO for DQPSK is **not** supported here.
 //! A caller that knows the receiver's ppm error should use that as a fallback.
 //! This is a coarse, high-confidence detector for a single symbol; it does not
-//! track the offset over time, does not replace the fractional-CFO loop and is
-//! **not yet wired into** [`crate::demod::sync`].
+//! track the offset over time and does not replace the fractional-CFO loop.
 //!
 //! # Untrusted input
 //!
