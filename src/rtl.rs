@@ -748,9 +748,9 @@ fn configure(
         (inner.set_sample_rate)(dev, sample_rate)
     })?;
     // ppm before tuning so the center frequency is corrected on the first try.
-    check("rtlsdr_set_freq_correction", unsafe {
-        (inner.set_freq_correction)(dev, ppm)
-    })?;
+    // Upstream Osmocom returns -2 when the requested ppm already matches the
+    // device (the initial correction is 0), so the default `ppm = 0` returns -2.
+    check_freq_correction(unsafe { (inner.set_freq_correction)(dev, ppm) })?;
     check("rtlsdr_set_center_freq", unsafe {
         (inner.set_center_freq)(dev, frequency_hz)
     })?;
@@ -782,6 +782,23 @@ fn check(operation: &'static str, code: i32) -> Result<()> {
         Err(RtlError::driver(operation, code))
     } else {
         Ok(())
+    }
+}
+
+/// Validate the return code of `rtlsdr_set_freq_correction`.
+///
+/// Upstream Osmocom librtlsdr returns `-2` (not `0`) when the requested
+/// correction already equals the device's current correction. The correction is
+/// initialised to `0`, so the default `ppm = 0` call always returns `-2`;
+/// treating that as a failure would make every default [`RtlLibrary::open`]
+/// fail. Only `-2` is tolerated in addition to `0`; every other non-zero code
+/// (including `-1`, `-3` and positive values) stays a hard error, and all other
+/// driver operations keep using the strict [`check`].
+fn check_freq_correction(code: i32) -> Result<()> {
+    if code == 0 || code == -2 {
+        Ok(())
+    } else {
+        Err(RtlError::driver("rtlsdr_set_freq_correction", code))
     }
 }
 
@@ -1086,5 +1103,36 @@ mod tests {
         assert_eq!(db_to_tenths(12.35), 124);
         assert_eq!(db_to_tenths(-0.05), -1);
         assert_eq!(db_to_tenths(0.0), 0);
+    }
+
+    #[test]
+    fn freq_correction_accepts_only_zero_and_already_set() {
+        // 0 is the normal success code; -2 means "already at this ppm", which
+        // is what upstream returns for the default ppm = 0 (initial correction).
+        assert!(check_freq_correction(0).is_ok());
+        assert!(check_freq_correction(-2).is_ok());
+
+        // Real failures and any out-of-band code stay errors.
+        for code in [-1, -3, -4, 1, 2, i32::MIN, i32::MAX] {
+            match check_freq_correction(code) {
+                Err(RtlError::Driver {
+                    operation,
+                    code: got,
+                }) => {
+                    assert_eq!(operation, "rtlsdr_set_freq_correction");
+                    assert_eq!(got, code);
+                }
+                other => panic!("code {code} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_check_rejects_already_set_freq_correction() {
+        // The general helper must not silently inherit the -2 exception.
+        assert!(check("rtlsdr_set_center_freq", 0).is_ok());
+        assert!(check("rtlsdr_set_freq_correction", -2).is_err());
+        assert!(check("rtlsdr_set_sample_rate", -2).is_err());
+        assert!(check("rtlsdr_set_center_freq", -1).is_err());
     }
 }

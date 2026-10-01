@@ -75,9 +75,13 @@
 //! bytes/samples, gaps, validated TMCC frames, emitted TS packets and reset
 //! reasons.
 
+use std::collections::VecDeque;
+
 use num_complex::Complex32;
 
-use crate::dsp::{normalize_u8_iq_into, DcBlocker, DspError, Mode, RationalResampler};
+use crate::dsp::{
+    normalize_u8_iq_into, DcBlocker, DspError, GuardInterval, Mode, RationalResampler,
+};
 
 use super::carriers::{differential_symbol, equalize_symbol, CarrierError};
 use super::coding::{demap, ChannelDecoder, CodingError, LayerConfig, Modulation};
@@ -86,7 +90,8 @@ use super::control::{
     SYMBOLS_PER_FRAME,
 };
 use super::frame::{FrameCollector, FrameError, ReceivedFrame};
-use super::sync::{SyncedSymbol, Synchronizer};
+use super::ofdm::segment_fft_size;
+use super::sync::{restore_timing_offset, SyncedSymbol, Synchronizer};
 
 // ---------------------------------------------------------------------------
 // Rates
@@ -136,6 +141,18 @@ const STALE_LIMIT_SYMBOLS: u64 = 2 * SYMBOLS_PER_FRAME as u64;
 /// always installs the pipeline on a validated frame, so this cannot fire
 /// before the first frame is even collected.
 const TS_STALL_FRAMES: u64 = 3;
+
+/// Emitted symbols a fresh control-plane (CP) lock may run without ever
+/// validating a TMCC frame before the domain is reset.
+///
+/// A genuine signal needs at least two frame periods to fill the TMCC window
+/// and confirm the alternating synchronising words (`2 * 204` symbols); the
+/// allowance is doubled to four so acquisition margin and a lossy first frame
+/// never truncate a valid lock. This is the only stale check that applies before
+/// a pipeline exists: without it a false CP lock (wrong timing / Mode on noise)
+/// would never be torn down, because [`enforce_stale`](Decoder::enforce_stale)
+/// used to return early while `pipeline` was `None`.
+const PRE_TMCC_TIMEOUT_SYMBOLS: u64 = 4 * SYMBOLS_PER_FRAME as u64;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -241,6 +258,37 @@ pub struct ReceiverStats {
     pub resets_ts_stall: u64,
 }
 
+/// Plain snapshot of the synchroniser / acquisition diagnostics.
+///
+/// [`ReceiverStats`] counts the whole pipeline lifetime; these describe the
+/// synchroniser's *current* lock. They exist so a session can log whether the
+/// control plane ever locked (CP lock), to which Mode / guard, how far the
+/// sample clock has drifted (the `timing_offset` SFO trend) and what CFO it
+/// settled on — none of which is visible from the aggregate counters alone.
+///
+/// Every optional field is `None` while the synchroniser is unlocked, so a
+/// caller never sees a stale mode / guard / CFO from a previous lock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReceiverDiagnostics {
+    /// Whether the synchroniser currently holds a timing/CFO (CP) lock.
+    pub cp_locked: bool,
+    /// Mode of the current lock, or `None` while unlocked.
+    pub mode: Option<Mode>,
+    /// Guard interval of the current lock, or `None` while unlocked.
+    pub guard: Option<GuardInterval>,
+    /// Continuity generation: increments on every (re-)acquisition.
+    pub generation: u64,
+    /// Internal synchroniser lock losses since construction.
+    pub losses: u64,
+    /// Confirmed integer-subcarrier CFO, or `None` while unconfirmed.
+    pub integer_bins: Option<i32>,
+    /// Smoothed CFO estimate in radians per sample, or `None` while unlocked.
+    pub cfo: Option<f32>,
+    /// Cumulative timing offset in samples (the SFO trend), or `None` while
+    /// unlocked.
+    pub timing_offset: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
@@ -294,16 +342,33 @@ impl Pipeline {
     /// is differential) and ignored for the coherent modulations, which
     /// estimate the channel from scattered pilots.
     ///
+    /// `timing_offset` is the synchroniser's cumulative SFO de-ramp for this
+    /// symbol (see [`SyncedSymbol::timing_offset`]). The coherent path undoes it
+    /// before estimating the channel. The DQPSK path uses the de-ramped carriers
+    /// unchanged: `current` and its `previous` reference are consecutive symbols
+    /// whose cumulative offsets differ, so their de-ramps differ by the
+    /// per-symbol increment and do **not** cancel exactly. DQPSK behaviour under
+    /// SFO is therefore inherited unchanged and is not corrected or verified
+    /// here.
+    ///
     /// Returns the TS packets completed by this symbol.
     fn consume_symbol(
         &mut self,
         carriers: &[Complex32],
         previous: Option<&[Complex32]>,
+        timing_offset: i64,
     ) -> Result<Vec<[u8; 188]>, ReceiverError> {
         // 1. Coherent equalisation / DQPSK differential demodulation, with
         //    intra-segment frequency de-interleaving.
         let equalised = match self.config.modulation {
             Modulation::Dqpsk => {
+                // The synchroniser de-ramps every carrier by the cumulative SFO
+                // phase `exp(-j 2*pi*signed_bin*timing_offset/N)`. `current` and
+                // `previous` are consecutive symbols whose cumulative offsets
+                // differ, so their de-ramps differ by the first difference of the
+                // SFO track and do not cancel exactly. The de-ramped carriers are
+                // used unchanged (behaviour deliberately preserved); DQPSK SFO
+                // correction is unverified and not attempted here.
                 let previous = previous.ok_or_else(|| {
                     ReceiverError::Internal(
                         "DQPSK symbol without a differential reference".to_string(),
@@ -311,7 +376,19 @@ impl Pipeline {
                 })?;
                 differential_symbol(self.mode, carriers, previous)?
             }
-            _ => equalize_symbol(self.mode, self.symbol_index, carriers)?,
+            _ => {
+                // The coherent scattered-pilot estimator linearly interpolates
+                // the channel across the 12-carrier pilot spacing. The SFO
+                // de-ramp is a linear phase across the carriers whose 12-carrier
+                // step grows without bound with the timing-offset trend, and once
+                // it approaches `pi` the interpolation is meaningless. Restore
+                // the physical (pre-de-ramp) carriers before equalising. The
+                // de-ramp stays on the carriers the frame collector uses, which
+                // the differential TMCC detector needs.
+                let mut physical = carriers.to_vec();
+                restore_timing_offset(&mut physical, timing_offset, segment_fft_size(self.mode));
+                equalize_symbol(self.mode, self.symbol_index, &physical)?
+            }
         };
         self.symbol_index = self.symbol_index.wrapping_add(1);
 
@@ -355,6 +432,17 @@ pub struct Decoder {
     /// Frame collector for the currently observed/locked mode. `None` until the
     /// synchroniser reports a mode or after a reset.
     collector: Option<FrameCollector>,
+    /// Per-symbol cumulative SFO timing offsets of the most recent
+    /// [`SYMBOLS_PER_FRAME`] synchronised symbols.
+    ///
+    /// The [`FrameCollector`] works on the de-ramped carriers (which the
+    /// differential TMCC products need); this parallel history exists so a
+    /// validated frame can hand the coherent scattered-pilot equaliser the exact
+    /// `timing_offset` of each of its symbols, letting it
+    /// [`restore_timing_offset`] to the physical carriers before interpolating
+    /// the channel. It is bounded to one frame and cleared wherever the frame
+    /// collector is reset.
+    timing_history: VecDeque<i64>,
 
     // Demod / FEC pipeline. `None` until a valid frame has configured it.
     pipeline: Option<Pipeline>,
@@ -434,6 +522,7 @@ impl Decoder {
             raw: Vec::new(),
             synchronizer: Synchronizer::new(),
             collector: None,
+            timing_history: VecDeque::with_capacity(SYMBOLS_PER_FRAME),
             pipeline: None,
             pending_out: Vec::new(),
             remainder: None,
@@ -454,6 +543,30 @@ impl Decoder {
     /// Running diagnostics.
     pub fn stats(&self) -> ReceiverStats {
         self.stats
+    }
+
+    /// Current synchroniser / acquisition diagnostics.
+    ///
+    /// Unlike [`stats`](Self::stats), which counts the pipeline's whole
+    /// lifetime, this reports the *current* CP lock: whether it is held, which
+    /// Mode / guard it locked to, its continuity generation and loss count, and
+    /// the CFO / timing-offset estimates. A session logs it to tell "no signal"
+    /// apart from "CP locked but no TS".
+    pub fn diagnostics(&self) -> ReceiverDiagnostics {
+        let (mode, guard) = match self.synchronizer.locked_mode_guard() {
+            Some((mode, guard)) => (Some(mode), Some(guard)),
+            None => (None, None),
+        };
+        ReceiverDiagnostics {
+            cp_locked: self.synchronizer.is_locked(),
+            mode,
+            guard,
+            generation: self.synchronizer.generation(),
+            losses: self.synchronizer.loss_count(),
+            integer_bins: self.synchronizer.integer_bins(),
+            cfo: self.synchronizer.cfo_estimate(),
+            timing_offset: self.synchronizer.timing_offset(),
+        }
     }
 
     /// Whether the decoder has recently produced a real RS-validated TS packet.
@@ -626,6 +739,14 @@ impl Decoder {
             if self.collector.is_none() {
                 self.collector = Some(FrameCollector::new(symbol.mode));
             }
+            // Keep the SFO timing window aligned with the frame collector's
+            // symbol window. Push *before* `collector.push` so that, when this
+            // symbol completes a frame, the window already includes it and the
+            // last `SYMBOLS_PER_FRAME` offsets match the returned carriers.
+            self.timing_history.push_back(symbol.timing_offset);
+            if self.timing_history.len() > SYMBOLS_PER_FRAME {
+                self.timing_history.pop_front();
+            }
             let frame = match self
                 .collector
                 .as_mut()
@@ -717,6 +838,21 @@ impl Decoder {
             self.last_ts_symbols = self.symbol_count;
         }
 
+        // The frame's carriers are the collector's last `SYMBOLS_PER_FRAME`
+        // symbols, and `timing_history` was pushed in lock-step and capped to
+        // the same length, so the two windows hold the same symbols in order.
+        // Collect the matching SFO offsets before borrowing the pipeline. A
+        // length mismatch means the windows have diverged: drop the domain and
+        // report it (as a typed error) instead of equalising against the wrong
+        // de-ramp.
+        let timing_offsets = match self.frame_timing_offsets(carriers.len()) {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                self.reset_domain(ResetReason::Sync);
+                return Err(error);
+            }
+        };
+
         let pipeline = self.pipeline.as_mut().ok_or_else(|| {
             ReceiverError::Internal("pipeline missing after configuration".into())
         })?;
@@ -733,8 +869,8 @@ impl Decoder {
         let mut packets = Vec::new();
         let mut failure = None;
         let mut previous = previous_carriers.as_deref();
-        for current in &carriers {
-            let result = pipeline.consume_symbol(current, previous);
+        for (current, &timing_offset) in carriers.iter().zip(timing_offsets.iter()) {
+            let result = pipeline.consume_symbol(current, previous, timing_offset);
             previous = Some(current);
             match result {
                 Ok(emitted) => packets.extend(emitted),
@@ -762,19 +898,54 @@ impl Decoder {
         Ok(rebuilt)
     }
 
+    /// The SFO timing offsets aligned with a validated frame's carriers.
+    ///
+    /// In production the frame collector's window and [`Self::timing_history`]
+    /// advance in lock-step and are both capped at [`SYMBOLS_PER_FRAME`], so the
+    /// histories always describe exactly the same symbols. Requiring an exact
+    /// length match instead of falling back to zero offsets means a divergence
+    /// is reported (and the domain is reset) rather than silently equalising a
+    /// broken history against the wrong de-ramp in release builds. Tests that
+    /// build a [`ReceivedFrame`] directly must supply the matching zero history
+    /// themselves.
+    fn frame_timing_offsets(&self, count: usize) -> Result<Vec<i64>, ReceiverError> {
+        if self.timing_history.len() != count {
+            return Err(ReceiverError::Internal(format!(
+                "SFO timing history ({} entries) does not match frame carriers ({count})",
+                self.timing_history.len(),
+            )));
+        }
+        Ok(self.timing_history.iter().copied().collect())
+    }
+
     /// Keep "locked" honest and rebuild a wedged FEC/time pipeline.
     ///
-    /// Before the pipeline is established this is a no-op so initial
-    /// acquisition (which needs at least two frames) is not interrupted.
+    /// Before the pipeline is established a false CP lock must still be torn
+    /// down: a wrong-timing / wrong-Mode lock on noise never validates a TMCC
+    /// frame, so it would otherwise sit in `pipeline == None` (and therefore
+    /// `resets == 0`) forever. A genuine signal is never interrupted because the
+    /// deadline is several frame periods, well past the two-frame confirmation.
+    /// Once a pipeline exists the original per-frame and TS-stall checks run
+    /// unchanged.
     fn enforce_stale(&mut self) {
-        let stall_limit = match self.pipeline.as_ref() {
-            Some(pipeline) => {
-                pipeline.warmup_symbols() + TS_STALL_FRAMES * SYMBOLS_PER_FRAME as u64
-            }
-            None => return,
-        };
-
         let since_frame = self.symbol_count.saturating_sub(self.last_frame_symbols);
+
+        if self.pipeline.is_none() {
+            if since_frame > PRE_TMCC_TIMEOUT_SYMBOLS {
+                // The CP lock outlived several frame periods without ever
+                // confirming a TMCC frame: it is false, so drop the domain
+                // (front end kept) and re-acquire.
+                self.reset_domain(ResetReason::TmccTimeout);
+            }
+            return;
+        }
+
+        let stall_limit = self
+            .pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.warmup_symbols() + TS_STALL_FRAMES * SYMBOLS_PER_FRAME as u64)
+            .unwrap_or(0);
+
         if since_frame > STALE_LIMIT_SYMBOLS {
             // No valid TMCC frame for too long: drop everything so stale
             // time-interleaver / Viterbi state cannot leak forward.
@@ -812,6 +983,7 @@ impl Decoder {
     fn reset_for_epoch(&mut self, generation: u64) {
         let had_state = self.collector.is_some() || self.pipeline.is_some() || self.locked;
         self.collector = None;
+        self.timing_history.clear();
         self.pipeline = None;
         self.locked = false;
         self.last_frame_symbols = self.symbol_count;
@@ -826,6 +998,7 @@ impl Decoder {
     fn reset_domain(&mut self, reason: ResetReason) {
         self.synchronizer.reset();
         self.collector = None;
+        self.timing_history.clear();
         self.pipeline = None;
         self.symbol_count = 0;
         self.epoch = None;
@@ -854,6 +1027,7 @@ impl Decoder {
         self.remainder = None;
         self.synchronizer.reset();
         self.collector = None;
+        self.timing_history.clear();
         self.pipeline = None;
         self.symbol_count = 0;
         self.epoch = None;
@@ -1119,6 +1293,25 @@ mod tests {
         assert_eq!(returned, vec![packet]);
     }
 
+    // ---- diagnostics accessor ----------------------------------------------
+
+    #[test]
+    fn diagnostics_report_absence_while_unlocked() {
+        // Unlocked: the current-lock snapshot must not invent a mode / guard /
+        // CFO, even though the aggregate counters stay available.
+        let decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
+        let diagnostics = decoder.diagnostics();
+
+        assert!(!diagnostics.cp_locked);
+        assert_eq!(diagnostics.mode, None);
+        assert_eq!(diagnostics.guard, None);
+        assert_eq!(diagnostics.generation, 0);
+        assert_eq!(diagnostics.losses, 0);
+        assert_eq!(diagnostics.integer_bins, None);
+        assert_eq!(diagnostics.cfo, None);
+        assert_eq!(diagnostics.timing_offset, None);
+    }
+
     // ---- synchroniser-generation (epoch) handling --------------------------
 
     use crate::demod::control::carriers_per_segment;
@@ -1146,6 +1339,7 @@ mod tests {
             mode,
             guard: GuardInterval::OneEighth,
             carriers: vec![Complex32::new(0.0, 0.0); carriers_per_segment(mode)],
+            timing_offset: 0,
             generation,
         }
     }
@@ -1227,12 +1421,14 @@ mod tests {
         let carriers = vec![Complex32::new(1.0, 0.0); total];
 
         assert!(matches!(
-            pipeline.consume_symbol(&carriers, None),
+            pipeline.consume_symbol(&carriers, None, 0),
             Err(ReceiverError::Internal(_))
         ));
 
         let previous = vec![Complex32::new(1.0, 0.0); total];
-        assert!(pipeline.consume_symbol(&carriers, Some(&previous)).is_ok());
+        assert!(pipeline
+            .consume_symbol(&carriers, Some(&previous), 0)
+            .is_ok());
     }
 
     #[test]
@@ -1240,6 +1436,9 @@ mod tests {
         let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
         let mode = Mode::Mode1;
         let total = carriers_per_segment(mode);
+        // A directly-constructed frame has no live synchroniser history; supply
+        // the identity (zero) offsets the production path would have carried.
+        decoder.timing_history = vec![0i64; SYMBOLS_PER_FRAME].into();
         let frame = ReceivedFrame {
             mode,
             config: differential_config(),
@@ -1263,6 +1462,7 @@ mod tests {
         let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
         let mode = Mode::Mode1;
         let total = carriers_per_segment(mode);
+        decoder.timing_history = vec![0i64; SYMBOLS_PER_FRAME].into();
         let frame = ReceivedFrame {
             mode,
             config: differential_config(),
@@ -1278,6 +1478,93 @@ mod tests {
             "a complete DQPSK frame must be consumed"
         );
         assert_eq!(decoder.stats().resets, 0);
+    }
+
+    // ---- SFO timing-history window ----------------------------------------
+
+    #[test]
+    fn timing_history_is_capped_and_cleared_by_domain_resets() {
+        let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
+        let mode = Mode::Mode1;
+
+        // More than one frame of symbols: the window must stay at one frame and
+        // hold the newest offsets.
+        let symbols: Vec<SyncedSymbol> = (0..SYMBOLS_PER_FRAME + 5)
+            .map(|index| SyncedSymbol {
+                timing_offset: index as i64,
+                ..test_symbol(mode, 1)
+            })
+            .collect();
+        decoder.consume_symbols(&symbols, false).unwrap();
+        assert_eq!(
+            decoder.timing_history.len(),
+            SYMBOLS_PER_FRAME,
+            "the SFO window must be capped to one frame"
+        );
+        assert_eq!(decoder.timing_history.front().copied(), Some(5));
+        assert_eq!(
+            decoder.timing_history.back().copied(),
+            Some(SYMBOLS_PER_FRAME as i64 + 4)
+        );
+
+        // A generation (epoch) change clears the stale window before the new
+        // symbol is pushed.
+        decoder
+            .consume_symbols(&[test_symbol(mode, 2)], false)
+            .unwrap();
+        assert_eq!(
+            decoder.timing_history.len(),
+            1,
+            "a generation change must clear the old SFO window"
+        );
+
+        // A gap and an explicit reset both drop the window entirely.
+        decoder.push_iq(&[], true).unwrap();
+        assert!(
+            decoder.timing_history.is_empty(),
+            "a gap must clear the SFO window"
+        );
+
+        decoder.timing_history.push_back(7);
+        decoder.reset();
+        assert!(
+            decoder.timing_history.is_empty(),
+            "an explicit reset must clear the SFO window"
+        );
+    }
+
+    #[test]
+    fn timing_history_mismatch_is_a_typed_error_without_ts() {
+        let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
+        let mode = Mode::Mode1;
+        let total = carriers_per_segment(mode);
+
+        // A deliberately inconsistent window (1 entry for a 2-symbol frame) must
+        // be reported rather than silently zero-filled into a bogus
+        // equalisation.
+        decoder.timing_history.push_back(0);
+        let frame = ReceivedFrame {
+            mode,
+            config: test_config(),
+            carriers: vec![vec![Complex32::new(1.0, 0.0); total]; 2],
+            previous_carriers: None,
+        };
+
+        let error = decoder.consume_frame_into(frame).unwrap_err();
+        assert!(
+            matches!(error, ReceiverError::Internal(_)),
+            "a timing-history mismatch must be a typed Internal error, got {error:?}"
+        );
+        assert!(
+            decoder.pending_out.is_empty(),
+            "a mismatch must not emit TS"
+        );
+        assert_eq!(decoder.stats().ts_packets, 0);
+        assert!(
+            decoder.pipeline.is_none(),
+            "the inconsistent domain must be dropped"
+        );
+        assert_eq!(decoder.stats().resets_sync, 1);
     }
 
     // ---- stale / stall recovery -------------------------------------------
@@ -1339,14 +1626,51 @@ mod tests {
     }
 
     #[test]
-    fn stale_enforcement_waits_for_the_first_pipeline() {
-        // Initial acquisition (two frames) must not be interrupted by the stale
-        // checks before any pipeline exists.
+    fn pre_tmcc_deadline_does_not_interrupt_two_frame_acquisition() {
+        // A genuine signal needs two frame periods to fill the TMCC window and
+        // confirm the alternating sync words; the pre-TMCC deadline must leave
+        // that acquisition alone.
         let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
-        decoder.symbol_count = 1_000_000;
+        decoder.collector = Some(FrameCollector::new(Mode::Mode1));
+        decoder.symbol_count = 2 * SYMBOLS_PER_FRAME as u64;
+        decoder.last_frame_symbols = 0;
+
         decoder.enforce_stale();
+
         assert_eq!(decoder.stats().resets, 0);
+        assert!(decoder.collector.is_some());
         assert!(decoder.pipeline.is_none());
+    }
+
+    #[test]
+    fn false_cp_lock_without_tmcc_is_bounded() {
+        // A fresh CP lock that never validates a TMCC frame must not live
+        // forever with `resets == 0` (the hardware false-lock symptom).
+        let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).unwrap();
+        decoder.collector = Some(FrameCollector::new(Mode::Mode1));
+        decoder.symbol_count = PRE_TMCC_TIMEOUT_SYMBOLS + 1;
+        decoder.last_frame_symbols = 0;
+
+        decoder.enforce_stale();
+
+        let stats = decoder.stats();
+        assert_eq!(stats.resets, 1);
+        assert_eq!(stats.resets_tmcc_timeout, 1);
+        assert_eq!(
+            stats.resets_ts_stall, 0,
+            "a pre-TMCC reset must not be counted as a TS stall"
+        );
+        assert!(
+            decoder.collector.is_none(),
+            "the domain must be re-acquired"
+        );
+        assert!(decoder.pipeline.is_none());
+        assert!(!decoder.is_locked());
+        // The reset restarts the domain counters, so the false lock is bounded:
+        // enforcing at the same symbol count again must not fire.
+        assert_eq!(decoder.symbol_count, 0);
+        decoder.enforce_stale();
+        assert_eq!(decoder.stats().resets, 1);
     }
 
     #[test]
@@ -1385,6 +1709,8 @@ mod tests {
 
         // Wrong carrier count makes the equaliser fail mid-frame.
         let total = carriers_per_segment(mode);
+        // One carrier vector in the frame, so exactly one SFO offset is needed.
+        decoder.timing_history = vec![0i64; 1].into();
         let frame = ReceivedFrame {
             mode,
             config,

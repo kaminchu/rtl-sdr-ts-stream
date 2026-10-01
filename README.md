@@ -39,38 +39,47 @@ stream 配信することを目標とする Rust 製 CLI / サーバです。
 >   テスト限定のモック。予約の解放（receiver スレッド join 後）・有界 queue・
 >   切断時のセマンティクスは**変更していません**。
 >
-> **検証は現時点ですべて合成です。** 送信機を本リポジトリ内に自作し（TS → RS →
-> エネルギー拡散 → インタリーブ → K=7 / パンクチャ → マッピング → OFDM → u8 IQ）、
-> その IQ を decoder に replay しています（`src/demod/replay_tests.rs`）。
-> **独立した録画 RF 信号の fixture は存在しません**。実機性能は未測定です。
+> **合成 replay の fixture は本リポジトリ内製です。** 送信機を本リポジトリ内に
+> 自作し（TS → RS → エネルギー拡散 → インタリーブ → K=7 / パンクチャ → マッピング
+> → OFDM → u8 IQ）、その IQ を decoder に replay しています
+> （`src/demod/replay_tests.rs`）。**独立した録画 RF fixture はリポジトリに含めて
+> いません。**
 >
-> 2026-09-30 時点の replay 実測
-> （`cargo test --release --lib demod::replay_tests -- --test-threads=1`）:
+> 2026-10-01 の release 品質ゲート実測（`cargo test --release`）:
+> **241 passed / 0 failed / 1 ignored**。明示実行した長時間 ignore テストは
+> **1 passed**。`cargo fmt --check` / `cargo check --all-targets` /
+> `cargo clippy --all-targets -- -D warnings` / aarch64 lib check も成功。
+> 現在の安定性検証の詳細は [`docs/stability.md`](docs/stability.md)。
 >
-> - carrier レベル（6 フレーム入力）: TMCC 5、TS 227（成功）。
-> - carrier レベル I=1（8 フレーム入力）: TMCC 7、TS 314（成功）。
-> - raw IQ 6 フレーム single push: **TMCC 4、TS 179**。8 フレームに延ばした
->   fixture でも **TMCC 4、TS 179** のままです（`tmcc_frames >= 5` assertion に
->   対し 4 のため、**この 1 本は現在も失敗**）。fixture / 取得条件の修正が進行中で、
->   **完了報告は受け取っていません**。
-> - raw IQ 5 フレーム chunked（4097 / 8191 / 3 byte）: TMCC 4、TS 179 で単一 push
->   と一致（成功）。gap 10 フレーム: gap 1 回で reset し再取得（成功）。
->
-> **したがって「全テスト成功」とは主張しません。** replay suite は
-> **6 本成功・1 本失敗**の観測です。修正完了後の再実行で counts を更新します。
+> N100 実機の実 IQ / 録画 IQ replay の記録は
+> [`docs/hardware-n100.md`](docs/hardware-n100.md) に分離しています（2026-09-30
+> 当時の部分・受入未完了記録）。現在の実機観測は
+> [`docs/stability.md`](docs/stability.md) §5 を参照。
 >
 > 既知の未対応・未検証:
 >
-> - **録画 RF / N100 / OrangePi 実機受入は未実施**。実時間性能・CPU / RSS は未測定。
+> - **N100 実機受入は部分**。2026-09-30 の部分記録に続き、**2026-10-01 10:04 JST
+>   の live 2 回（25 s / 15 s、ch19 / auto gain / ppm 0）は CP 同期して
+>   `200 video/mp2t` chunked を返し、TS を出力**しました（attempt 1: 6426 TS /
+>   body 1208088 byte、attempt 2: 3742 TS / 703496 byte）。**30 分連続・
+>   OrangePi PC2・エンドツーエンド CPU / RSS 予算は未実施**で、slow batch の
+>   headroom リスクは残ります。最新は
+>   [`docs/hardware-n100.md`](docs/hardware-n100.md) §10 と
+>   [`docs/stability.md`](docs/stability.md) §5.1。
 > - **DQPSK はコードとしては統合済み**（`carriers::differential_symbol` と
 >   `Decoder` の差動経路）ですが、**raw DQPSK の replay は未検証**です（replay
->   fixture は QPSK 同期変調のみ）。
+>   fixture は QPSK 同期変調のみ）。**DQPSK の SFO 補正は未検証**で、整数 CFO の
+>   自動補正もありません（既知の ppm は呼び出し側が指定する想定）。
 > - **TMCC パリティは誤り訂正ではなく検査のみ**です。パリティ不一致のフレームは
 >   破棄し、取得からやり直します（reject / re-acquire）。
-> - **整数 CFO の取得は未実装**。同期が推定するのは CP 相関に基づく（`1/fft_size`
->   周期の）**小数 CFO** のみです。
-> - **サンプルクロック追従は簡素**です。シンボルごとの `±4` サンプル探索のみで、
->   SFO（サンプル周波数オフセット）の専用追従はありません。
+> - **整数 CFO はコヒーレントセグメントで実装済み**です。粗探索を同期器に統合し、
+>   同一の整数推定が連続確認されたときだけ補正します（非ゼロ補正はロック世代を
+>   進める）。DQPSK は SP が無いため自動補正しません。
+> - **SFO 累積 timing de-ramp は維持**しつつ、コヒーレント SP 等化の前に巻き戻し、
+>   シンボル履歴を 1 フレーム分保持して厳密に対応付けます。DQPSK は de-ramp を
+>   そのまま使うため SFO 下の挙動は未検証です。
+> - Viterbi は **ACS ごとに再正規化**し、メトリックは `f64`。ストリーミングの
+>   NaN / ±inf は消失として扱い、ブロック API は `NonFinite` で拒否します。
 > - SIMD は IQ 正規化にのみ存在し、**性能測定は未実施**。
 >
 > テスト用モックは `tests/` 配下にのみ存在し、本番バイナリには含まれません。
@@ -108,14 +117,12 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 > 日付つきの実測スナップショットを
-> [`docs/implementation-status.md`](docs/implementation-status.md) に記録しています。
-> **2026-09-30 時点で全ゲート成功とは主張しません。** raw IQ replay の
-> `raw_iq_replay_decodes_exact_contiguous_ts` が `tmcc_frames >= 5` を満たさず
-> 失敗しており（TMCC 4、TS 179）、fixture / 取得条件の修正が進行中です。
-> 修正完了後に `fmt --check` / `check --all-targets` / `test` /
-> `clippy --all-targets -- -D warnings` / `build --release` を再実行して counts を
-> 更新します。本 README は「通るはず」ではなく「実際に走らせた結果」を実装状況
-> ドキュメント側に記録する方針です。
+> [`docs/implementation-status.md`](docs/implementation-status.md) と
+> [`docs/stability.md`](docs/stability.md) に記録しています。2026-10-01 の release
+> 実測は `cargo test --release` **241 passed / 0 failed / 1 ignored**、明示実行の
+> 長時間 ignore テスト **1 passed**、`fmt` / `check` / `clippy` / aarch64 lib
+> check 成功です。本 README は「通るはず」ではなく「実際に走らせた結果」を
+> 実装状況ドキュメント側に記録する方針です。
 
 ## 2. 実行 (CLI)
 
@@ -163,10 +170,12 @@ stderr に出ます。
 | `504 Gateway Timeout` | 初期ロックが既定 10 秒でタイムアウト（実デバイスで信号がない場合を含む） |
 
 > `GET /stream` の `200 video/mp2t` chunked 応答は、テスト限定モックと、合成
-> replay でデコードした TS で確認されています。**実機・録画 RF での受信確認は
-> 未実施**です（[`docs/implementation-status.md`](docs/implementation-status.md)
-> 参照）。実デバイスで復調器がロックできない場合は `503` ではなく **既定 10 秒で
-> `504 Gateway Timeout`** になります。この 504 経路はモック（空 receiver =
+> replay でデコードした TS で確認されています。**N100 実機でも 2026-10-01 10:04
+> JST の live 2 回（25 s / 15 s）で `200` と TS を観測しました**が、**30 分連続・
+> 実機受入は未達**です（[`docs/hardware-n100.md`](docs/hardware-n100.md) §10、
+> [`docs/stability.md`](docs/stability.md) §5.1）。実デバイスで復調器が
+> ロックできない場合は `503` ではなく **既定 10 秒で `504 Gateway Timeout`** に
+> なります。この 504 経路はモック（空 receiver =
 > `NoSignal` のみ）で検証されています。ダミー TS を流す偽装はしません。
 >
 > 初期ロックの既定 10 秒は `Backend::open` が戻った後から計測します。デバイスの
@@ -225,7 +234,8 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
   送信側を自作し（TS → RS → エネルギー拡散 → インタリーブ → K=7 / パンクチャ →
   マッピング → OFDM → u8 IQ）、その IQ を `Decoder::push_iq` に流して TS を復元
   します。carrier レベルと raw IQ の両方を検証します。**独立した録画 RF 信号の
-  fixture は存在しません。** 実行する受入コマンドは
+  fixture はリポジトリに含めていません**（N100 実機の録画 IQ replay は
+  [`docs/hardware-n100.md`](docs/hardware-n100.md) の別記録）。実行する受入コマンドは
   `cargo test --release --lib demod::replay_tests -- --test-threads=1` です
   （[`docs/acceptance.md`](docs/acceptance.md) §2）。
 - テストの性格は [`docs/implementation-status.md`](docs/implementation-status.md)
@@ -240,11 +250,13 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
   - **送信機生成 IQ（transmitter-generated）:** 自作送信機の IQ を replay する統合
     検証。復調器の各段が揃って初めて通りますが、**独立録画 RF ではない**ため
     実伝搬・実機の証明にはなりません。
-  - **実機未検証（real-RF unverified）:** 実 IQ / 録画 IQ / 既知の受信ベクトルは
-    未入手で、性能は未測定です。
+  - **実機検証（real-RF）:** N100 実機の録画 IQ を取得し replay で TS まで到達
+    （部分。[`docs/hardware-n100.md`](docs/hardware-n100.md)）。ただし**リポジトリ
+    fixture としては未整備**で、実機の独立受入・性能測定は未実施です。
 - `src/demod/` は `src/lib.rs` から公開され、本番バックエンドに接続されています。
-  ただし **2026-09-30 時点で replay の 1 本（`raw_iq_replay_...`）が失敗**して
-  おり、全品質ゲート成功とは主張しません（fixture 修正が進行中）。
+  2026-10-01 の release 品質ゲートは
+  `cargo test --release` **241 passed / 0 failed / 1 ignored**、明示実行の長時間
+  ignore テスト **1 passed** です（[`docs/stability.md`](docs/stability.md)）。
 
 ## 8. ドキュメント
 
@@ -259,6 +271,14 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
   配布上の注意（広範な法的保証はしない）。
 - [`docs/acceptance.md`](docs/acceptance.md) — 合成受入と実機受入を分離した
   受入コマンド一覧と判定基準（Python / GNU Radio / gr-isdb を使用しない）。
+- [`docs/hardware-n100.md`](docs/hardware-n100.md) — N100 実機の受信記録。
+  2026-09-30 の部分・未完了記録（環境、録画 IQ / TS の構造検証、live `504` の
+  切り分け未了）を履歴として保持しつつ、§10 に 2026-10-01 10:04 JST の live 成功
+  （SHORT）を追記。
+- [`docs/stability.md`](docs/stability.md) — **現在**の安定性検証。Viterbi / SFO /
+  整数 CFO の修正、release 品質ゲート **241/0/1**、長時間 ignore 1 passed、
+  2026-10-01 10:04 JST の live 2 回（25 s / 15 s、CP 同期・`200`）と、以前の
+  CP false 観測を履歴として分離して記録（§5）。
 - 要件と実装計画: [`plans/SPEC.md`](plans/SPEC.md)、
   [`plans/実装計画.md`](plans/実装計画.md)（計画を正とする。本書はその実装状況を
   記録するもの）。
@@ -274,21 +294,26 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 - ISDB-T の**復調・FEC・TS 出力パイプラインは本番に接続済み**（`src/demod/` を
   `src/session.rs` の `rtl_backend` が駆動）。ユーザー目標はソフトウェア経路として
   存在する。
-- ただし検証は**合成 replay のみ**。**独立した録画 RF fixture は存在しない**。
-- **raw IQ replay の 1 本が 2026-09-30 時点で失敗中**（TMCC 4、TS 179、
-  `tmcc_frames >= 5` assertion）。fixture / 取得条件の修正が進行中で、全テスト成功
-  とは主張しない。
+- 検証の中心は**合成 replay**。**独立した録画 RF fixture はリポジトリに含めていない**
+  （N100 実機の録画 IQ replay は [`docs/hardware-n100.md`](docs/hardware-n100.md)）。
+- release 品質ゲートは **241 passed / 0 failed / 1 ignored**（2026-10-01 実測）。
+  長時間 ignore テストを明示実行すると **1 passed**。
 - **DQPSK はコード統合済みだが、raw DQPSK replay は未検証**（fixture は QPSK）。
+  整数 CFO の自動補正と SFO 補正も未対応・未検証。
 - **TMCC パリティは検査のみで誤り訂正なし**。不一致フレームは破棄して再取得する。
-- **整数 CFO の取得は未実装**（CP 相関による小数 CFO のみ）。
-- **サンプルクロック追従は簡素**（シンボルごとの `±4` サンプル探索のみ）。
+- **整数 CFO はコヒーレントセグメントで実装済み**（粗探索の連続確認後に補正）。
+- **SFO 累積 de-ramp は TMCC / DQPSK 用に維持**し、コヒーレント SP 等化の前に
+  巻き戻す。シンボル履歴は 1 フレーム分を厳密に検証する。
 - 本番 `/stream` はロック時に `200 video/mp2t` を返す。`503` は `librtlsdr` /
   デバイス不可か非対応サンプルレートのときのみ。無信号は既定 10 秒で `504`。
   ダミー TS は流さない。
 - SIMD 最適化（AVX2 / NEON）は IQ 正規化のみ。**性能測定は未実施**。
-- N100 / OrangePi PC2 の実機受入は**未実施**。aarch64 は
-  `cargo check --target aarch64-unknown-linux-gnu --lib` の成功のみで、実機実行の
-  証明ではない。
+- N100 実機受入は**部分**。2026-10-01 10:04 JST の live 2 回（25 s / 15 s）は
+  CP 同期して `200 video/mp2t` を返し TS を出力（[`docs/hardware-n100.md`](docs/hardware-n100.md)
+  §10、[`docs/stability.md`](docs/stability.md) §5.1）。ただし 30 分連続・
+  **OrangePi PC2**・エンドツーエンド CPU / RSS 予算は**未実施**。
+  aarch64 は `cargo check --target aarch64-unknown-linux-gnu --lib` の成功のみで、
+  実機実行の証明ではない。
 - サブコマンドや HTTP 契約の一部はモックでのみ検証済み。
 - 停止は receiver の `stop()`・デストラクタ・スレッド join の完了まで待つ。
   デバイスの open / 設定は同期・非プリエンプティブで、停止要求でも呼び出しが

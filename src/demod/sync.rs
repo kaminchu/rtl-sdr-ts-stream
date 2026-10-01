@@ -199,7 +199,26 @@ pub struct SyncedSymbol {
     /// Guard interval detected for this symbol.
     pub guard: GuardInterval,
     /// Corrected centre-segment carriers.
+    ///
+    /// These carry the carrier-dependent timing de-ramp described in
+    /// [`compensate_timing_offset`]: a cumulative sample-clock-offset (SFO)
+    /// track is removed with `exp(-j 2*pi * signed_bin * timing_offset / N)`.
+    /// That de-ramp is what keeps the differential TMCC and DQPSK products
+    /// carrier-phase-coherent across the integer sample jumps of the timing
+    /// tracker. Because it is cumulative it is also a linear phase ramp across
+    /// the carriers, so a coherent scattered-pilot estimator must undo it first
+    /// (see [`restore_timing_offset`]) with [`SyncedSymbol::timing_offset`].
     pub carriers: Vec<Complex32>,
+    /// Cumulative timing offset, in samples, applied as the carrier-dependent
+    /// de-ramp to [`SyncedSymbol::carriers`].
+    ///
+    /// This is the sample-frequency-offset (SFO) trend. It is the exact value
+    /// needed to undo the de-ramp, so downstream stages that must see the
+    /// physical (pre-de-ramp) carriers — in particular the coherent
+    /// scattered-pilot channel estimator, whose linear interpolation fails once
+    /// the 12-carrier pilot phase step approaches `pi` — can call
+    /// [`restore_timing_offset`].
+    pub timing_offset: i64,
     /// Lock generation this symbol belongs to.
     ///
     /// The synchroniser increments its generation every time it establishes
@@ -347,6 +366,35 @@ impl Synchronizer {
         self.lock
             .filter(|lock| lock.coarse_locked)
             .map(|lock| lock.integer_bins)
+    }
+
+    /// The detected mode and guard interval of the current lock.
+    ///
+    /// `None` while unlocked. Both values describe the same lock, so they are
+    /// returned together: a caller can never pair a mode and a guard read from
+    /// two different locks. Used for diagnostics only.
+    pub fn locked_mode_guard(&self) -> Option<(Mode, GuardInterval)> {
+        self.lock.map(|lock| (lock.mode, lock.guard))
+    }
+
+    /// The current smoothed CFO estimate in radians per sample, or `None` while
+    /// unlocked.
+    ///
+    /// When [`integer_bins`](Self::integer_bins) is `Some` this includes the
+    /// confirmed integer-subcarrier correction; for a differential (DQPSK)
+    /// segment it is the fractional-only estimate. Used for diagnostics only.
+    pub fn cfo_estimate(&self) -> Option<f32> {
+        self.lock.map(|lock| lock.cfo)
+    }
+
+    /// Cumulative timing offset, in samples, of the chosen symbol start relative
+    /// to the fixed acquisition grid, or `None` while unlocked.
+    ///
+    /// This is the sample-frequency-offset (SFO) trend: a steadily growing
+    /// magnitude means the sample clock is drifting relative to the transmitter
+    /// and the tracker is compensating. Used for diagnostics only.
+    pub fn timing_offset(&self) -> Option<i64> {
+        self.lock.map(|lock| lock.timing_offset)
     }
 
     /// Drop all buffered samples and return to the un-locked state.
@@ -642,6 +690,7 @@ impl Synchronizer {
                     mode: lock.mode,
                     guard: lock.guard,
                     carriers,
+                    timing_offset,
                     generation: symbol_generation,
                 });
                 next_start = start_abs + symbol_len as u64;
@@ -818,6 +867,27 @@ fn compensate_timing_offset(carriers: &mut [Complex32], timing_offset: i64, fft_
         let im = carrier.re * sin + carrier.im * cos;
         *carrier = Complex32::new(re, im);
     }
+}
+
+/// Re-apply the carrier-dependent phase ramp that
+/// [`compensate_timing_offset`] removed, recovering the physical
+/// (pre-de-ramp) carriers.
+///
+/// The de-ramp is a unitary per-carrier rotation, so its inverse is the same
+/// rotation with the opposite `timing_offset`. A coherent scattered-pilot
+/// channel estimator must run on the recovered carriers: the cumulative de-ramp
+/// is a linear phase ramp across the carriers whose 12-carrier scattered-pilot
+/// step grows without bound with the SFO trend, and once that step approaches
+/// `pi` the complex linear pilot interpolation can no longer follow it. The
+/// de-ramp must still be applied to [`SyncedSymbol::carriers`] for the
+/// differential TMCC / DQPSK products, which is why it is undone here rather
+/// than removed from the synchroniser.
+pub(crate) fn restore_timing_offset(
+    carriers: &mut [Complex32],
+    timing_offset: i64,
+    fft_size: usize,
+) {
+    compensate_timing_offset(carriers, timing_offset.saturating_neg(), fft_size);
 }
 
 /// Search all twelve Mode / guard candidates for the highest multi-symbol
@@ -1153,6 +1223,28 @@ mod tests {
                     assert_eq!(symbol.fft_size(), segment_fft_size(mode));
                     assert_eq!(symbol.symbol_len(), segment_symbol_len(mode, guard));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn lock_diagnostics_accessors_track_the_lock() {
+        // Unlocked: every accessor must report absence rather than a default.
+        let sync = Synchronizer::new();
+        assert_eq!(sync.locked_mode_guard(), None);
+        assert_eq!(sync.cfo_estimate(), None);
+        assert_eq!(sync.timing_offset(), None);
+        assert_eq!(sync.integer_bins(), None);
+
+        for mode in Mode::ALL {
+            for guard in GuardInterval::ALL {
+                let (stream, _) = synthesize(mode, guard, 20, 0.0, 0x5EED_0000);
+                let mut sync = Synchronizer::new();
+                sync.push(&stream);
+                assert!(sync.is_locked(), "{mode:?}/{guard:?}: not locked");
+                assert_eq!(sync.locked_mode_guard(), Some((mode, guard)));
+                assert!(sync.cfo_estimate().is_some_and(f32::is_finite));
+                assert!(sync.timing_offset().is_some());
             }
         }
     }

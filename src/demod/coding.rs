@@ -42,7 +42,10 @@
 //!   handing this decoder a soft stream whose first carrier symbol is the first
 //!   symbol of an OFDM frame. The *byte* frame phase (where inside the frame the
 //!   PRBS starts) is acquired from the stream itself by
-//!   [`ChannelDecoder::with_mode`]; see [`packets_per_frame`].
+//!   [`ChannelDecoder::with_mode`]; see [`packets_per_frame`]. The byte
+//!   de-interleaver commutator phase is likewise acquired from the raw Viterbi
+//!   sync grid (four sync bytes [`TSP_SIZE`] apart) before the branches are fed,
+//!   so no fixed phase is assumed for the caller's byte alignment.
 //! * 90-degree carrier-phase ambiguity of coherent modulation. Only the global
 //!   180-degree bit inversion (which maps the TS sync byte `0x47` to `0xB8`) is
 //!   detected, by the validated sync search described in [`ChannelDecoder`].
@@ -179,6 +182,51 @@ const MAX_BLOCK_FAILURES: usize = 3;
 /// a clean stream. Holds the acquisition search window plus one block, which
 /// guarantees at least three post-loss sync bytes are available to [`FrameSync::acquire`].
 const RAW_REACQUIRE_BYTES: usize = SYNC_SEARCH_MIN + TSP_SIZE;
+
+/// Buffered bytes at which a single complete acquisition sweep is run.
+///
+/// [`SYNC_SEARCH_MIN`] bytes are enough to test every one of the `TSP_SIZE`
+/// possible byte phases with the two-block RS/TS confirmation; the extra
+/// `TSP_SIZE` is the carry retained after a failed sweep. Advancing by exactly
+/// one TSP between sweeps means each byte phase is examined once per new packet
+/// of data, instead of once per pushed byte.
+const ACQUIRE_WINDOW: usize = SYNC_SEARCH_MIN + TSP_SIZE;
+
+/// Reed-Solomon attempt budget of one acquisition sweep, in units of
+/// [`FrameSync::packets_per_frame`].
+///
+/// One genuine byte phase needs at most `2 * packets_per_frame` attempts (two
+/// block confirmations per frame phase); the factor of six leaves room for a
+/// few spurious sync phases without ever truncating acquisition of a real
+/// signal. A stream that carries a sync byte at every phase (a constant `0x47`
+/// stream) would otherwise force a full frame-phase search for all `TSP_SIZE`
+/// phases; this bounds that work per sweep.
+const ACQUIRE_BUDGET_FACTOR: usize = 6;
+
+/// Number of sync bytes on the transmission-TSP grid required to pin the byte
+/// de-interleaver's commutator phase.
+///
+/// ARIB STD-B31 §3.4/§3.7: the sync byte is the last byte of each transmission
+/// TSP, and the 12-branch byte interleaver maps every sync onto the same branch,
+/// so the raw (still interleaved) Viterbi stream still carries a sync byte every
+/// [`TSP_SIZE`] bytes. Four grid points rule out a chance run of `0x47` data
+/// bytes and fix the grid residue modulo `12`.
+const PHASE_SYNC_COUNT: usize = 4;
+
+/// Raw Viterbi bytes spanned by [`PHASE_SYNC_COUNT`] grid syncs.
+const PHASE_GRID_SPAN: usize = (PHASE_SYNC_COUNT - 1) * TSP_SIZE;
+
+/// Minimum raw Viterbi bytes before the byte-phase search can succeed.
+const PHASE_SEARCH_MIN: usize = PHASE_GRID_SPAN + 1;
+
+/// Soft upper bound on raw Viterbi bytes retained while the commutator phase is
+/// still unknown.
+///
+/// Bounding the buffer keeps a no-sync input (or a long acquisition transient)
+/// from growing without limit. The extra [`PHASE_GRID_SPAN`] over the round
+/// `4096` guarantees that a sync grid straddling the discard point still has all
+/// four points available once the last of them arrives.
+const PHASE_BUFFER_LIMIT: usize = 4096 + PHASE_GRID_SPAN;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -439,6 +487,62 @@ fn k7_transition(state: u8, input: u8) -> (u8, u8, u8) {
     (next, out1 as u8, out2 as u8)
 }
 
+/// Renormalise cumulative path metrics so the best finite value is exactly
+/// `0.0`.
+///
+/// Path metrics are cumulative sums of soft branch values, so over a long
+/// stream they grow without bound. Once the magnitude approaches the precision
+/// limit, adding a soft value to two nearly-equal survivors rounds both to the
+/// same value and the decoder can no longer separate them. Subtracting the
+/// maximum finite metric every ACS step keeps the finite window bounded
+/// independently of the number of decoded symbols while preserving the relative
+/// ordering, so the same survivor is selected. `NEG_INFINITY` marks an
+/// unreachable state and is left untouched.
+///
+/// Metrics are held as `f64` even though soft values are `f32`. The largest
+/// finite soft value is `f32::MAX`, and the spread of one ACS step's candidates
+/// is bounded by a small multiple of it; a worst-case K=7 merge-window spread
+/// is around `1e41`, far inside the `f64` range but already overflowing `f32`.
+/// Casting to `f64` before the branch sum therefore keeps every finite `f32`
+/// input well-defined with no arithmetic clamp on the public API.
+fn renormalise_metrics(metrics: &mut [f64; K7_STATES]) {
+    let mut maximum = f64::NEG_INFINITY;
+    for &value in metrics.iter() {
+        if value > maximum {
+            maximum = value;
+        }
+    }
+    if !maximum.is_finite() {
+        return;
+    }
+    for value in metrics.iter_mut() {
+        if value.is_finite() {
+            *value -= maximum;
+        }
+    }
+    debug_assert!(
+        metrics.iter().all(|&value| value <= 0.0),
+        "renormalised metrics must be non-positive"
+    );
+    debug_assert!(
+        metrics.contains(&0.0),
+        "the best reachable state must renormalise to zero"
+    );
+}
+
+/// Map a soft value onto `f64` for the streaming metric accumulator.
+///
+/// A finite `f32` is widened losslessly. A `NaN` or infinite value carries no
+/// usable soft information and is treated as an erasure (`0.0`) so it cannot
+/// poison the metrics (see [`StreamingViterbi::push`]).
+fn sanitise_soft(value: f32) -> f64 {
+    if value.is_finite() {
+        f64::from(value)
+    } else {
+        0.0
+    }
+}
+
 /// Continuous soft-decision Viterbi decoder for the K=7 rate-1/2 code.
 ///
 /// Unlike [`crate::fec::decode_k7_soft`] this decoder never re-initialises the
@@ -449,7 +553,10 @@ fn k7_transition(state: u8, input: u8) -> (u8, u8, u8) {
 /// self-correcting within a few constraint lengths for a noiseless input).
 #[derive(Debug, Clone)]
 struct StreamingViterbi {
-    metrics: [f32; K7_STATES],
+    /// Cumulative path metrics, held as `f64` so any finite `f32` soft value —
+    /// including `f32::MAX` — cannot overflow the ACS sum (see
+    /// [`renormalise_metrics`]).
+    metrics: [f64; K7_STATES],
     /// Predecessor state per destination state, one slot per decoded step.
     trace: Vec<[u8; K7_STATES]>,
     steps: usize,
@@ -458,7 +565,7 @@ struct StreamingViterbi {
 
 impl StreamingViterbi {
     fn new() -> Self {
-        let mut metrics = [f32::NEG_INFINITY; K7_STATES];
+        let mut metrics = [f64::NEG_INFINITY; K7_STATES];
         metrics[0] = 0.0;
         Self {
             metrics,
@@ -470,7 +577,7 @@ impl StreamingViterbi {
 
     fn best_state(&self) -> u8 {
         let mut best = 0usize;
-        let mut best_metric = f32::NEG_INFINITY;
+        let mut best_metric = f64::NEG_INFINITY;
         for (index, &metric) in self.metrics.iter().enumerate() {
             if metric > best_metric {
                 best_metric = metric;
@@ -481,8 +588,19 @@ impl StreamingViterbi {
     }
 
     /// Feed one soft pair `(X_t, Y_t)`.
+    ///
+    /// The public API is `f32`, but a non-finite value cannot carry a
+    /// meaningful soft decision. Such a value is treated explicitly as an
+    /// erasure (`0.0`) rather than being propagated into the metrics, so a
+    /// caller that hands over `NaN` or `±inf` (for example from an upstream
+    /// divide) still gets a finite, panicking-free decode. This is deliberately
+    /// more permissive than the block [`crate::fec::decode_k7_soft`], which
+    /// reports [`crate::fec::FecError::NonFinite`]; the streaming decoder has
+    /// no error channel, so erasure is the safe equivalent.
     fn push(&mut self, soft0: f32, soft1: f32) {
-        let mut next = [f32::NEG_INFINITY; K7_STATES];
+        let soft0 = sanitise_soft(soft0);
+        let soft1 = sanitise_soft(soft1);
+        let mut next = [f64::NEG_INFINITY; K7_STATES];
         let mut predecessor = [0u8; K7_STATES];
 
         for (state, &base) in self.metrics.iter().enumerate() {
@@ -502,6 +620,7 @@ impl StreamingViterbi {
             }
         }
 
+        renormalise_metrics(&mut next);
         self.metrics = next;
         self.trace[self.steps % K7_TRACEBACK] = predecessor;
         self.steps += 1;
@@ -569,6 +688,134 @@ fn prbs_byte(state: &mut u16) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Byte de-interleaver phase acquisition
+// ---------------------------------------------------------------------------
+
+/// Raw-Viterbi-stream acquisition of the byte de-interleaver commutator phase.
+///
+/// The receiver's 12-branch de-interleaver is only correct when its commutator
+/// starts on the branch that will carry the transmission-TSP sync byte. ARIB
+/// STD-B31 §3.4 places the sync byte last in each 204-byte TSP and §3.7 maps
+/// every sync onto one fixed branch, so the raw Viterbi bytes (before
+/// de-interleaving) still contain a sync byte every [`TSP_SIZE`] bytes. The
+/// absolute byte offset at which the caller starts feeding the decoder is
+/// arbitrary — it depends on the upstream OFDM/bit pipeline, not on the byte
+/// interleaver's period — so the commutator phase is inferred from the grid:
+///
+/// ```text
+/// initial_branch = (11 - first_sync_index % 12 + 12) % 12
+/// ```
+///
+/// while the search buffers the raw Viterbi bytes. Once the phase is known the
+/// buffered prefix is replayed through the real de-interleaver from that phase
+/// and every later byte follows the normal path.
+///
+/// Random `0x47` data bytes cannot place four points on the grid by chance, and
+/// the candidate is still gated by [`FrameSync`]'s RS/TS validation, so nothing
+/// is fabricated. If no grid appears before [`PHASE_BUFFER_LIMIT`], the oldest
+/// bytes are discarded (in multiples of the branch count, so the grid residue —
+/// the only thing the phase depends on — is preserved).
+#[derive(Debug, Clone)]
+struct BytePhaseDetector {
+    /// Raw Viterbi bytes held until the grid is found.
+    buffer: VecDeque<u8>,
+    /// Number of bytes discarded from the front of `buffer` so far. Kept a
+    /// multiple of [`BYTE_INTERLEAVE_BRANCHES`], hence the global index of
+    /// `buffer[0]` never changes the grid residue.
+    discarded: usize,
+    /// Total bytes ever pushed (monotonic; drives the search throttle).
+    seen: usize,
+    /// `seen` at which the next grid search runs.
+    next_search: usize,
+    /// Inferred initial de-interleaver branch (`0..12`).
+    phase: usize,
+    /// Whether the phase has been found.
+    acquired: bool,
+}
+
+impl BytePhaseDetector {
+    fn new() -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            discarded: 0,
+            seen: 0,
+            next_search: PHASE_SEARCH_MIN,
+            phase: 0,
+            acquired: false,
+        }
+    }
+
+    fn acquired(&self) -> bool {
+        self.acquired
+    }
+
+    fn phase(&self) -> usize {
+        self.phase
+    }
+
+    /// Push one raw Viterbi byte.
+    ///
+    /// Returns `Some(buffered)` exactly once, when this byte completes the sync
+    /// grid; the caller must replay `buffered` through the byte de-interleaver
+    /// with the commutator set to [`phase`](Self::phase). While unlocked the
+    /// byte is retained (bounded by [`PHASE_BUFFER_LIMIT`]); once locked nothing
+    /// is buffered and the caller feeds bytes normally.
+    fn push(&mut self, byte: u8) -> Option<Vec<u8>> {
+        if self.acquired {
+            return None;
+        }
+        self.buffer.push_back(byte);
+        self.seen += 1;
+
+        // Search at most once per TSP of new data: a grid whose last point has
+        // just arrived is seen at the next search, and `find_grid` scans every
+        // candidate offset anyway.
+        if self.seen >= self.next_search {
+            self.next_search = self.seen + TSP_SIZE;
+            if let Some(index) = self.find_grid() {
+                self.acquired = true;
+                let first_sync = self.discarded + index;
+                self.phase = (BYTE_INTERLEAVE_BRANCHES - 1 + BYTE_INTERLEAVE_BRANCHES
+                    - first_sync % BYTE_INTERLEAVE_BRANCHES)
+                    % BYTE_INTERLEAVE_BRANCHES;
+                return Some(self.buffer.drain(..).collect());
+            }
+        }
+
+        if self.buffer.len() > PHASE_BUFFER_LIMIT {
+            // Discard whole branch-count groups so the retained stream keeps the
+            // same commutator residue; then the global index above stays
+            // congruent to the local one and the inferred phase is unaffected.
+            let excess = self.buffer.len() - PHASE_BUFFER_LIMIT;
+            let drop = (excess.div_ceil(BYTE_INTERLEAVE_BRANCHES) * BYTE_INTERLEAVE_BRANCHES)
+                .min(self.buffer.len());
+            self.buffer.drain(..drop);
+            self.discarded += drop;
+        }
+        None
+    }
+
+    /// Find the earliest offset whose byte repeats every [`TSP_SIZE`] for
+    /// [`PHASE_SYNC_COUNT`] points and is a sync byte of one polarity.
+    fn find_grid(&self) -> Option<usize> {
+        let length = self.buffer.len();
+        if length <= PHASE_GRID_SPAN {
+            return None;
+        }
+        for index in 0..=length - PHASE_SEARCH_MIN {
+            let value = self.buffer[index];
+            if value != TS_SYNC && value != TS_SYNC_INVERTED {
+                continue;
+            }
+            if (1..PHASE_SYNC_COUNT).all(|point| self.buffer[index + point * TSP_SIZE] == value) {
+                return Some(index);
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Frame synchroniser / derandomiser
 // ---------------------------------------------------------------------------
 
@@ -618,6 +865,26 @@ struct FrameSync {
     raw: VecDeque<u8>,
     /// Consecutive failed 204-byte blocks since the last validated packet.
     failures: usize,
+    /// Reed-Solomon decode attempts made by acquisition since construction.
+    ///
+    /// Exposed for the deterministic acquisition-cost regression test: it counts
+    /// real [`candidate_decodes`](FrameSync::candidate_decodes) RS calls, so a
+    /// worst-case input can be bounded by an operation count rather than by a
+    /// flaky wall-clock measurement.
+    rs_attempts: u64,
+    /// Rotating start offset of the next acquisition sweep (`0..TSP_SIZE`).
+    ///
+    /// A sweep that exhausts its RS budget returns `None`, and [`push`](Self::push)
+    /// then drops exactly [`TSP_SIZE`] bytes, which does **not** change the byte
+    /// phase of any offset. Without a persistent cursor the next sweep would
+    /// therefore restart at offset `0` and re-test the same leading phases: a
+    /// cluster of spurious sync phases ahead of the genuine one would consume
+    /// the whole budget on every sweep and starve acquisition permanently. The
+    /// cursor records where an exhausted sweep stopped so the next sweep resumes
+    /// there and every one of the `TSP_SIZE` byte phases is eventually examined.
+    /// It is cleared on a successful acquisition (and by [`ChannelDecoder::reset`],
+    /// which rebuilds the synchroniser).
+    scan_start: usize,
 }
 
 impl FrameSync {
@@ -635,6 +902,8 @@ impl FrameSync {
             post: VecDeque::new(),
             raw: VecDeque::new(),
             failures: 0,
+            rs_attempts: 0,
+            scan_start: 0,
         }
     }
 
@@ -647,7 +916,14 @@ impl FrameSync {
 
         if !self.locked {
             self.search.push_back(byte);
-            if self.search.len() >= SYNC_SEARCH_MIN {
+            // Sweep only when a whole acquisition window is buffered. Sweeping
+            // once per pushed byte while unlocked would re-test every one of the
+            // `TSP_SIZE` byte phases against every frame phase for every byte,
+            // which is O(TSP_SIZE * packets_per_frame) Reed-Solomon decodes per
+            // byte. One sweep here examines all phases once; a failed sweep then
+            // drops exactly one TSP so the next sweep starts on the next new
+            // byte phase rather than rescanning the same offsets.
+            if self.search.len() >= ACQUIRE_WINDOW {
                 if let Some((offset, frame_pos, inverted)) = self.acquire() {
                     self.locked = true;
                     self.inverted = inverted;
@@ -665,10 +941,9 @@ impl FrameSync {
                     }
                     return out;
                 }
-            }
-            // Keep the search bounded when there is no valid frame.
-            while self.search.len() > SYNC_SEARCH_MIN + TSP_SIZE {
-                self.search.pop_front();
+                for _ in 0..TSP_SIZE {
+                    self.search.pop_front();
+                }
             }
             return out;
         }
@@ -746,13 +1021,25 @@ impl FrameSync {
 
     /// Try to acquire the byte, frame and polarity phase from the buffered
     /// bytes. Returns `(sync_offset, frame_pos, inverted)` on success.
-    fn acquire(&self) -> Option<(usize, usize, bool)> {
+    fn acquire(&mut self) -> Option<(usize, usize, bool)> {
         if self.search.len() < SYNC_SEARCH_MIN {
             return None;
         }
-        for offset in 0..TSP_SIZE {
+        // Bound the RS work of one sweep. A genuine byte phase needs at most
+        // `2 * packets_per_frame` attempts; the factor leaves room for a few
+        // spurious phases, but stops a stream whose every phase looks like a
+        // sync grid from forcing a full frame-phase search at every phase.
+        let mut budget = ACQUIRE_BUDGET_FACTOR * self.packets_per_frame;
+        // Rotate the scan start. A failed sweep drops exactly `TSP_SIZE` bytes,
+        // so an offset denotes the same byte phase every time; restarting at
+        // offset `0` would re-test the same leading phases and let a cluster of
+        // spurious syncs ahead of the genuine one consume the budget forever.
+        // Resuming at `scan_start` makes consecutive sweeps cover new phases
+        // until all `TSP_SIZE` have been examined.
+        for step in 0..TSP_SIZE {
+            let offset = (self.scan_start + step) % TSP_SIZE;
             if offset + 2 * TSP_SIZE >= self.search.len() {
-                break;
+                continue;
             }
             let a = self.search[offset];
             let b = self.search[offset + TSP_SIZE];
@@ -765,23 +1052,43 @@ impl FrameSync {
             // The packet grid is fixed; only the position inside the frame is
             // unknown, so test every plausible packet position (bounded).
             for j in 0..self.packets_per_frame {
+                if budget == 0 {
+                    // Resume from the phase that did not fit; the next sweep
+                    // re-tests it with a full budget and then moves on.
+                    self.scan_start = offset;
+                    return None;
+                }
+                budget -= 1;
                 let frame_pos = (TSP_SIZE - 1) + TSP_SIZE * j;
-                if self.candidate_decodes(offset, frame_pos, inverted)
-                    && self.candidate_decodes(offset + TSP_SIZE, frame_pos + TSP_SIZE, inverted)
-                {
+                if !self.candidate_decodes(offset, frame_pos, inverted) {
+                    continue;
+                }
+                if budget == 0 {
+                    self.scan_start = offset;
+                    return None;
+                }
+                budget -= 1;
+                if self.candidate_decodes(offset + TSP_SIZE, frame_pos + TSP_SIZE, inverted) {
+                    // A fresh search always starts from the first phase.
+                    self.scan_start = 0;
                     return Some((offset, frame_pos, inverted));
                 }
             }
         }
+        // The budget outlasted the whole grid: the next sweep restarts at 0.
+        self.scan_start = 0;
         None
     }
 
     /// Derandomise the 204-byte block starting at `search[start]` assuming it is
     /// a sync at frame offset `frame_pos`, then RS-decode and validate it.
-    fn candidate_decodes(&self, start: usize, frame_pos: usize, inverted: bool) -> bool {
+    fn candidate_decodes(&mut self, start: usize, frame_pos: usize, inverted: bool) -> bool {
         if start + TSP_SIZE > self.search.len() {
             return false;
         }
+        // Count only real decode attempts, so the acquisition-cost regression
+        // test measures RS work rather than cheap bounds checks.
+        self.rs_attempts += 1;
         let mut codeword = [0u8; TSP_SIZE];
         let mut pos = frame_pos % self.frame_bytes;
         for (t, slot) in codeword.iter_mut().enumerate() {
@@ -859,6 +1166,9 @@ pub struct ChannelDecoder {
     byte_branches: Vec<VecDeque<u8>>,
     byte_in_index: usize,
     deinterleaved_count: usize,
+    /// Acquires the byte de-interleaver commutator phase from the raw Viterbi
+    /// sync grid before any byte is fed to the branches.
+    byte_phase: BytePhaseDetector,
     frame: FrameSync,
 }
 
@@ -931,6 +1241,7 @@ impl ChannelDecoder {
             byte_branches,
             byte_in_index: 0,
             deinterleaved_count: 0,
+            byte_phase: BytePhaseDetector::new(),
             frame,
         })
     }
@@ -964,6 +1275,12 @@ impl ChannelDecoder {
     /// `bits` may be split arbitrarily across calls; the decoder buffers partial
     /// carrier symbols. Soft values must use the [`demap`] sign convention
     /// (positive favours bit `0`).
+    ///
+    /// A non-finite soft value (`NaN`/`±inf`) is treated as an erasure (`0.0`):
+    /// the streaming decoder has no error channel, so this keeps the Viterbi
+    /// metrics finite and the call panic-free instead of propagating the value.
+    /// This differs from the block [`crate::fec::decode_k7_soft`], which rejects
+    /// non-finite input with [`crate::fec::FecError::NonFinite`].
     pub fn push_soft(&mut self, bits: &[f32]) -> Vec<[u8; TS_PACKET_SIZE]> {
         let mut out = Vec::new();
         self.symbol_input.extend(bits.iter().copied());
@@ -1040,6 +1357,25 @@ impl ChannelDecoder {
     }
 
     fn feed_byte(&mut self, byte: u8, out: &mut Vec<[u8; TS_PACKET_SIZE]>) {
+        if self.byte_phase.acquired() {
+            self.deinterleave_byte(byte, out);
+            return;
+        }
+        // While the commutator phase is unknown the raw Viterbi bytes are
+        // retained by the detector. When it finds the sync grid it returns the
+        // buffered prefix, which is then replayed through the real de-interleaver
+        // starting from the inferred phase; later bytes take the fast path above.
+        if let Some(buffered) = self.byte_phase.push(byte) {
+            self.byte_in_index = self.byte_phase.phase();
+            for buffered_byte in buffered {
+                self.deinterleave_byte(buffered_byte, out);
+            }
+        }
+    }
+
+    /// Write one byte through the 12-branch de-interleaver and hand any complete
+    /// de-interleaved block to the frame synchroniser.
+    fn deinterleave_byte(&mut self, byte: u8, out: &mut Vec<[u8; TS_PACKET_SIZE]>) {
         let branch = self.byte_in_index % BYTE_INTERLEAVE_BRANCHES;
         self.byte_in_index += 1;
         let queue = &mut self.byte_branches[branch];
@@ -1399,6 +1735,118 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // ---- byte de-interleaver phase acquisition ----------------------------
+
+    /// Build a stream whose only sync bytes sit on a `TSP_SIZE` grid starting at
+    /// `start`, with zeros everywhere else.
+    fn grid_stream(value: u8, start: usize, count: usize) -> Vec<u8> {
+        let mut stream = vec![0u8; start];
+        for _ in 0..count {
+            stream.push(value);
+            stream.extend(std::iter::repeat_n(0u8, TSP_SIZE - 1));
+        }
+        stream
+    }
+
+    /// Feed `stream` through a fresh detector, returning it (after acquisition,
+    /// if any) and the buffered prefix replayed at acquisition.
+    fn detect_phase(stream: &[u8]) -> (BytePhaseDetector, Vec<u8>) {
+        let mut detector = BytePhaseDetector::new();
+        let mut buffered = Vec::new();
+        for &byte in stream {
+            if let Some(prefix) = detector.push(byte) {
+                assert!(buffered.is_empty(), "acquisition must happen once");
+                buffered = prefix;
+            }
+        }
+        (detector, buffered)
+    }
+
+    fn expected_phase(first_sync_index: usize) -> usize {
+        (BYTE_INTERLEAVE_BRANCHES - 1 + BYTE_INTERLEAVE_BRANCHES
+            - first_sync_index % BYTE_INTERLEAVE_BRANCHES)
+            % BYTE_INTERLEAVE_BRANCHES
+    }
+
+    #[test]
+    fn byte_phase_detector_finds_all_twelve_offsets() {
+        for offset in 0..BYTE_INTERLEAVE_BRANCHES {
+            let stream = grid_stream(TS_SYNC, offset, PHASE_SYNC_COUNT);
+            let (detector, buffered) = detect_phase(&stream);
+            assert!(detector.acquired(), "offset {offset} was not acquired");
+            assert_eq!(
+                detector.phase(),
+                expected_phase(offset),
+                "offset {offset} inferred the wrong commutator phase"
+            );
+            // The replayed prefix is exactly the consumed stream prefix: no byte
+            // is dropped and none is fabricated.
+            assert!(!buffered.is_empty(), "offset {offset} replayed nothing");
+            assert_eq!(
+                buffered.as_slice(),
+                &stream[..buffered.len()],
+                "offset {offset} replayed a non-prefix"
+            );
+            assert_eq!(detector.seen, buffered.len(), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn byte_phase_detector_accepts_both_sync_polarities() {
+        for value in [TS_SYNC, TS_SYNC_INVERTED] {
+            let offset = 5;
+            let stream = grid_stream(value, offset, PHASE_SYNC_COUNT);
+            let (detector, _) = detect_phase(&stream);
+            assert!(
+                detector.acquired(),
+                "polarity {value:#04x} was not acquired"
+            );
+            assert_eq!(detector.phase(), expected_phase(offset));
+        }
+    }
+
+    #[test]
+    fn byte_phase_detector_does_not_acquire_on_zeros() {
+        let mut detector = BytePhaseDetector::new();
+        for _ in 0..(PHASE_BUFFER_LIMIT * 3) {
+            assert!(detector.push(0x00).is_none());
+        }
+        assert!(!detector.acquired(), "all-zero input must not acquire");
+        assert!(
+            detector.buffer.len() <= PHASE_BUFFER_LIMIT,
+            "retention {} exceeded the limit {}",
+            detector.buffer.len(),
+            PHASE_BUFFER_LIMIT,
+        );
+        assert!(detector.discarded > 0, "the buffer must have been trimmed");
+        assert_eq!(detector.discarded % BYTE_INTERLEAVE_BRANCHES, 0);
+        assert_eq!(detector.discarded + detector.buffer.len(), detector.seen);
+    }
+
+    /// A grid that arrives only after the retention bound has already discarded
+    /// a prefix must still infer the phase from the *global* sync index, which is
+    /// why the discarded count is kept a multiple of the branch count.
+    #[test]
+    fn byte_phase_detector_retention_preserves_global_index() {
+        const PREFIX: usize = 20_000;
+        let mut stream = vec![0u8; PREFIX];
+        stream.extend(grid_stream(TS_SYNC, 0, PHASE_SYNC_COUNT));
+
+        let (detector, buffered) = detect_phase(&stream);
+        assert!(detector.acquired(), "grid after retention was not acquired");
+        assert_eq!(
+            detector.phase(),
+            expected_phase(PREFIX),
+            "the discarded prefix changed the inferred phase"
+        );
+        assert!(
+            detector.discarded > 0,
+            "the prefix must have been discarded"
+        );
+        assert!(buffered.len() < stream.len());
+        assert_eq!(detector.discarded + buffered.len(), detector.seen);
+    }
+
     // ---- streaming Viterbi ------------------------------------------------
 
     #[test]
@@ -1442,6 +1890,205 @@ mod tests {
         viterbi.flush();
         let decoded: Vec<u8> = viterbi.pending.iter().copied().collect();
         assert_eq!(decoded, bits);
+    }
+
+    /// Over a long stream the ACS metrics must not drift with the absolute
+    /// number of decoded symbols.
+    ///
+    /// Path metrics are cumulative, so without renormalisation they grow as
+    /// `steps * |soft|`; with `|soft| = 1e6` and 100 000 steps the accumulator
+    /// would reach ~2e11, where the f32 unit in the last place exceeds the soft
+    /// step and distinct survivors round together. Subtracting the best finite
+    /// metric every step holds the finite window flat, and the decoder still
+    /// recovers the exact encoder input.
+    #[test]
+    fn streaming_viterbi_long_stream_metrics_stay_bounded() {
+        const BITS: usize = 100_000;
+        const BIG: f32 = 1.0e6;
+        let mut state = 0x9E37_79B9u32;
+        let bits: Vec<u8> = (0..BITS)
+            .map(|_| (xorshift(&mut state) & 1) as u8)
+            .collect();
+        let mut encoder = K7Encoder::new();
+        let encoded = encoder.encode(&bits);
+        let soft: Vec<f32> = encoded
+            .iter()
+            .map(|&bit| if bit == 0 { BIG } else { -BIG })
+            .collect();
+
+        let mut viterbi = StreamingViterbi::new();
+        let mut widest = 0.0f64;
+        for pair in soft.chunks(2) {
+            viterbi.push(pair[0], pair[1]);
+            let mut maximum = f64::NEG_INFINITY;
+            let mut minimum = f64::INFINITY;
+            for &metric in &viterbi.metrics {
+                if metric.is_finite() {
+                    maximum = maximum.max(metric);
+                    minimum = minimum.min(metric);
+                }
+            }
+            assert!(
+                maximum <= 0.0,
+                "the best finite metric must renormalise to zero"
+            );
+            widest = widest.max(maximum - minimum);
+        }
+        viterbi.flush();
+        let decoded: Vec<u8> = viterbi.pending.iter().copied().collect();
+        assert_eq!(decoded, bits, "long stream did not decode exactly");
+        // A conservative K=7 merge-window bound that is independent of `BITS`
+        // and far below the ~2e11 an unnormalised accumulator would reach here.
+        assert!(
+            widest <= 2.0 * f64::from(BIG) * K7_TRACEBACK as f64,
+            "finite metric window grew to {widest}"
+        );
+    }
+
+    /// A constant, very large soft pair (a completely uniform input) is a
+    /// degenerate trellis with many equal branches. Renormalisation must keep
+    /// every reachable metric finite, leave unreachable states at
+    /// `NEG_INFINITY`, and still decode the all-zero path.
+    #[test]
+    fn streaming_viterbi_uniform_large_soft_is_safe() {
+        const BIG: f32 = 1.0e12;
+        let mut viterbi = StreamingViterbi::new();
+        for _ in 0..50_000 {
+            viterbi.push(BIG, BIG);
+            for &metric in &viterbi.metrics {
+                assert!(
+                    metric.is_finite() || metric == f64::NEG_INFINITY,
+                    "metric {metric} is neither finite nor the unreachable marker"
+                );
+            }
+        }
+        viterbi.flush();
+        assert!(!viterbi.pending.is_empty());
+        assert!(
+            viterbi.pending.iter().all(|&bit| bit == 0),
+            "the uniform positive stream must decode to the all-zero path"
+        );
+    }
+
+    /// Assert the streaming metric invariant: no metric is `NaN`, every metric
+    /// is finite or the unreachable marker, and the best finite metric has been
+    /// renormalised to exactly zero.
+    fn assert_streaming_metrics_healthy(viterbi: &StreamingViterbi) {
+        let mut maximum = f64::NEG_INFINITY;
+        for &metric in &viterbi.metrics {
+            assert!(!metric.is_nan(), "metric must never be NaN");
+            assert!(
+                metric.is_finite() || metric == f64::NEG_INFINITY,
+                "metric {metric} is neither finite nor the unreachable marker"
+            );
+            if metric.is_finite() {
+                assert!(metric <= 0.0, "finite metric {metric} is positive");
+                maximum = maximum.max(metric);
+            }
+        }
+        assert_eq!(
+            maximum, 0.0,
+            "the best finite metric must renormalise to zero"
+        );
+    }
+
+    /// `f32::MAX` is the largest finite soft value. A one-step ACS sum of two of
+    /// them overflows `f32` to `+inf` (so the old code skipped renormalisation
+    /// and stored non-finite metrics); the `f64` accumulator must keep every
+    /// metric finite, renormalised, and NaN-free, including when the sign of the
+    /// extreme input alternates every step.
+    #[test]
+    fn streaming_viterbi_handles_extreme_finite_soft() {
+        let mut viterbi = StreamingViterbi::new();
+        for step in 0..4096usize {
+            let (a, b) = if step % 2 == 0 {
+                (f32::MAX, f32::MAX)
+            } else {
+                (-f32::MAX, -f32::MAX)
+            };
+            viterbi.push(a, b);
+            assert_streaming_metrics_healthy(&viterbi);
+        }
+        viterbi.flush();
+        assert!(!viterbi.pending.is_empty());
+    }
+
+    /// At `f32::MAX` magnitude only the signs carry information, but that is
+    /// all the decoder needs: widening to `f64` makes the extreme vector
+    /// numerically identical (up to a common positive scale) to the `±1` ideal,
+    /// so the encoder input must be recovered exactly.
+    #[test]
+    fn streaming_viterbi_decodes_at_max_finite_magnitude() {
+        let mut state = 0x51ED_2701u32;
+        let bits: Vec<u8> = (0..400).map(|_| (xorshift(&mut state) & 1) as u8).collect();
+        let mut encoder = K7Encoder::new();
+        let encoded = encoder.encode(&bits);
+        let soft: Vec<f32> = encoded
+            .iter()
+            .map(|&bit| if bit == 0 { f32::MAX } else { -f32::MAX })
+            .collect();
+
+        let mut viterbi = StreamingViterbi::new();
+        for pair in soft.chunks(2) {
+            viterbi.push(pair[0], pair[1]);
+            assert_streaming_metrics_healthy(&viterbi);
+        }
+        viterbi.flush();
+        let decoded: Vec<u8> = viterbi.pending.iter().copied().collect();
+        assert_eq!(decoded, bits, "max-magnitude soft stream did not decode");
+    }
+
+    /// Non-finite streaming soft values must be treated as explicit erasures
+    /// (`0.0`): they must neither poison the metrics with `NaN` nor panic. The
+    /// result must be bit-for-bit what the same finite values pushed directly as
+    /// `0.0` produce.
+    #[test]
+    fn streaming_viterbi_treats_non_finite_soft_as_erasure() {
+        let polluted_seq = [
+            (f32::NAN, 1.0f32),
+            (f32::INFINITY, -1.0),
+            (-f32::INFINITY, f32::NAN),
+            (0.5, f32::NEG_INFINITY),
+            (f32::MAX, f32::NAN),
+        ];
+        let mut polluted = StreamingViterbi::new();
+        let mut erased = StreamingViterbi::new();
+        for &(a, b) in &polluted_seq {
+            polluted.push(a, b);
+            let clean = |value: f32| if value.is_finite() { value } else { 0.0 };
+            erased.push(clean(a), clean(b));
+            assert_streaming_metrics_healthy(&polluted);
+        }
+        assert_eq!(
+            polluted.metrics, erased.metrics,
+            "a non-finite soft value must behave exactly like the 0.0 erasure"
+        );
+    }
+
+    /// The public streaming entry point must accept a stream containing `NaN`
+    /// and `±inf` without panicking, and without ever producing a non-finite
+    /// metric. It may decode nothing, but it must stay well-defined.
+    #[test]
+    fn channel_decoder_push_soft_non_finite_does_not_panic() {
+        let config = LayerConfig {
+            modulation: Modulation::Qpsk,
+            rate: PunctureRate::Rate1_2,
+            interleave: 0,
+        };
+        let mut decoder = ChannelDecoder::with_mode(Mode::Mode3, config).unwrap();
+        let input = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            -f32::MAX,
+        ];
+        for _ in 0..2048 {
+            let _ = decoder.push_soft(&input);
+            // Whatever is (not) decoded, no metric may be NaN or non-finite.
+            assert_streaming_metrics_healthy(&decoder.viterbi);
+        }
+        let _ = decoder.flush();
     }
 
     // ---- transmitter-side test chain --------------------------------------
@@ -1601,6 +2248,48 @@ mod tests {
             let split = decode_chunked(Mode::Mode3, &soft, config, chunk);
             assert_eq!(whole, split, "chunk size {chunk}");
         }
+    }
+
+    /// The metric renormalisation must be invisible to the caller: a long
+    /// stream whose soft magnitudes are large (only the signs carry
+    /// information) must still recover the transmitted packets, and the result
+    /// must not depend on how the soft stream is split across `push_soft`.
+    ///
+    /// Scaling every soft value by the same positive constant cannot change any
+    /// decision, but it would blow up an unnormalised accumulator within this
+    /// stream length (three Mode-3 frames) and could flip close decisions.
+    #[test]
+    fn long_large_soft_stream_is_chunk_independent() {
+        let mode = Mode::Mode3;
+        let modulation = Modulation::Qpsk;
+        let rate = PunctureRate::Rate1_2;
+        let per_frame = packets_per_frame(mode, modulation, rate);
+        let count = 3 * per_frame;
+        let packets: Vec<[u8; TS_PACKET_SIZE]> = (0..count).map(|k| make_ts(k as u8)).collect();
+        let mut soft = frame_soft(mode, &packets, modulation, rate);
+        for value in &mut soft {
+            *value *= 1.0e6;
+        }
+        let config = LayerConfig {
+            modulation,
+            rate,
+            interleave: 0,
+        };
+
+        let mut reference: Option<Vec<[u8; TS_PACKET_SIZE]>> = None;
+        for chunk in [1usize, 7, 64, 204, 4096, 65536] {
+            let decoded = decode_chunked(mode, &soft, config, chunk);
+            match &reference {
+                None => reference = Some(decoded),
+                Some(expected) => assert_eq!(*expected, decoded, "chunk size {chunk}"),
+            }
+        }
+        let decoded = reference.expect("at least one chunk size ran");
+        assert!(!decoded.is_empty(), "no packets recovered");
+        assert!(
+            decoded.iter().all(|packet| packets[1..].contains(packet)),
+            "large-soft stream fabricated a packet"
+        );
     }
 
     #[test]
@@ -1996,5 +2685,123 @@ mod tests {
                 "tail is not contiguous after re-acquisition (offset {offset})"
             );
         }
+    }
+
+    /// Worst-case acquisition cost, measured as an operation count rather than
+    /// wall-clock time so the regression is deterministic.
+    ///
+    /// A constant `0x47` stream makes *every* byte phase look like a sync grid,
+    /// so an unbounded acquisition search would run a full frame-phase RS search
+    /// at all `TSP_SIZE` phases on every sweep. The sweep budget caps the
+    /// Reed-Solomon attempts per window, and advancing one TSP per sweep means
+    /// the total grows only with the number of windows. The same stream must not
+    /// lock and must not fabricate output.
+    #[test]
+    fn adversarial_constant_sync_stream_has_bounded_acquisition_cost() {
+        let mode = Mode::Mode3;
+        let modulation = Modulation::Qpsk;
+        let rate = PunctureRate::Rate1_2;
+        let per_frame = packets_per_frame(mode, modulation, rate);
+        let frame_bytes = per_frame * TSP_SIZE;
+
+        const EXTRA: usize = 40 * TSP_SIZE;
+        let stream_len = ACQUIRE_WINDOW + EXTRA;
+
+        let mut sync = FrameSync::new(frame_bytes, per_frame);
+        let mut emitted = 0usize;
+        for _ in 0..stream_len {
+            emitted += sync.push(TS_SYNC).len();
+        }
+
+        assert!(
+            !sync.locked,
+            "a constant 0x47 stream must not acquire a lock"
+        );
+        assert_eq!(emitted, 0, "a constant stream must not fabricate packets");
+
+        // The first sweep fires once the first full window is buffered, then one
+        // more per TSP_SIZE bytes pushed.
+        let sweeps = 1 + EXTRA / TSP_SIZE;
+        let budget = ACQUIRE_BUDGET_FACTOR * per_frame;
+        assert!(
+            sync.rs_attempts <= (sweeps * budget) as u64,
+            "RS attempts {} exceeded the {sweeps}-sweep budget {}",
+            sync.rs_attempts,
+            sweeps * budget,
+        );
+        // Each sweep must actually examine its candidate phase, and the bounded
+        // total must stay well below the unbounded `TSP_SIZE`-phases-per-sweep
+        // work (204 * 48 attempts per sweep here).
+        assert!(
+            sync.rs_attempts >= (sweeps * per_frame) as u64,
+            "RS attempts {} are too low to have examined the candidate phase",
+            sync.rs_attempts,
+        );
+        let unbounded = sweeps * TSP_SIZE * per_frame;
+        assert!(
+            sync.rs_attempts < unbounded as u64,
+            "RS attempts {} are not bounded below a full phase sweep ({unbounded})",
+            sync.rs_attempts,
+        );
+    }
+
+    /// A budget-exhausted sweep must advance a persistent scan cursor so the
+    /// acquisition search eventually examines every one of the `TSP_SIZE` byte
+    /// phases instead of starving on the first few.
+    ///
+    /// A constant `0x47` stream makes every phase look like a sync grid, so each
+    /// sweep burns its whole RS budget and returns `None`. Because a failed
+    /// sweep drops exactly one TSP, offset `k` denotes the same byte phase on
+    /// every sweep; before the cursor existed the search restarted at `0` each
+    /// time and never reached later phases. This test drives [`FrameSync::acquire`]
+    /// directly on a fixed buffer, reconstructs the forward range each sweep
+    /// examined from the cursor movement, and asserts complete coverage. It is
+    /// an operation-count invariant, not a wall-clock measurement.
+    #[test]
+    fn acquisition_cursor_covers_all_phases_under_budget_exhaustion() {
+        let mode = Mode::Mode3;
+        let modulation = Modulation::Qpsk;
+        let rate = PunctureRate::Rate1_2;
+        let per_frame = packets_per_frame(mode, modulation, rate);
+        let frame_bytes = per_frame * TSP_SIZE;
+
+        let mut sync = FrameSync::new(frame_bytes, per_frame);
+        // Every byte phase is a sync on this grid, but no candidate RS-decodes,
+        // so every sweep exhausts its budget and returns `None`.
+        sync.search = std::iter::repeat_n(TS_SYNC, ACQUIRE_WINDOW).collect();
+        assert_eq!(sync.scan_start, 0);
+
+        let mut covered = [false; TSP_SIZE];
+        let mut previous = sync.scan_start;
+        // The cursor advances by at least one offset per sweep, so `TSP_SIZE`
+        // sweeps always suffice to wrap the grid; the loop breaks as soon as
+        // coverage is complete.
+        for sweep in 0..TSP_SIZE {
+            assert!(
+                sync.acquire().is_none(),
+                "constant-sync grid acquired on sweep {sweep}"
+            );
+            let next = sync.scan_start;
+            assert!(
+                next != previous || covered.iter().all(|&c| c),
+                "sweep {sweep} made no progress (cursor stuck at {previous})"
+            );
+            // Mark the forward half-open range actually examined this sweep.
+            let mut offset = previous;
+            while offset != next {
+                covered[offset] = true;
+                offset = (offset + 1) % TSP_SIZE;
+            }
+            previous = next;
+            if covered.iter().all(|&c| c) {
+                break;
+            }
+        }
+
+        let missing: Vec<usize> = (0..TSP_SIZE).filter(|&index| !covered[index]).collect();
+        assert!(
+            missing.is_empty(),
+            "budget exhaustion left byte phases unexamined: {missing:?}"
+        );
     }
 }

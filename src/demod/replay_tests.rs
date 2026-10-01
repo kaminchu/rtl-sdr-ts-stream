@@ -417,6 +417,14 @@ fn quantize_to_u8_iq(segment: &[Complex32]) -> Vec<u8> {
 
     let mut baseband = Vec::new();
     resampler.process(&flushed, &mut baseband);
+    quantize_baseband_to_u8(&baseband)
+}
+
+/// Peak-normalise a real-valued baseband capture and quantise it to interleaved
+/// `u8` I/Q, exactly as [`quantize_to_u8_iq`] does. Shared by the nominal
+/// rational-resample path and the fractional sample-clock-offset path so both
+/// quantise identically.
+fn quantize_baseband_to_u8(baseband: &[Complex32]) -> Vec<u8> {
     assert!(!baseband.is_empty(), "resampler produced no samples");
 
     let peak = baseband
@@ -427,7 +435,7 @@ fn quantize_to_u8_iq(segment: &[Complex32]) -> Vec<u8> {
     let gain = TX_NORMALISED_SCALE / peak;
 
     let mut bytes = Vec::with_capacity(baseband.len() * 2);
-    for value in &baseband {
+    for value in baseband {
         for component in [value.re * gain, value.im * gain] {
             let quantised = (component * 127.5 + 127.5).round().clamp(0.0, 255.0) as u8;
             bytes.push(quantised);
@@ -438,6 +446,78 @@ fn quantize_to_u8_iq(segment: &[Complex32]) -> Vec<u8> {
         "all samples railed; normalisation is broken"
     );
     bytes
+}
+
+/// Interpolate the segment-rate waveform at fractional sample positions with a
+/// centred Hann-windowed sinc kernel.
+///
+/// The one-segment signal is band-limited to well under half the segment rate
+/// (`~432` of `1024` bins), so a short windowed sinc reproduces it accurately;
+/// this is the standard way to evaluate a non-integer sampling grid without the
+/// artificial per-frame whole-sample insertion that would change the OFDM
+/// timing discontinuously.
+fn sample_windowed_sinc(x: &[Complex32], position: f64) -> Complex32 {
+    /// Kernel half-width in input samples.
+    const HALF: isize = 12;
+    let base = position.floor();
+    let frac = position - base;
+    let base = base as isize;
+
+    let mut acc = Complex32::new(0.0, 0.0);
+    for tap in -HALF + 1..=HALF {
+        let index = base + tap;
+        if index < 0 || index as usize >= x.len() {
+            continue;
+        }
+        let distance = frac - tap as f64;
+        let sinc = if distance == 0.0 {
+            1.0
+        } else {
+            let arg = std::f64::consts::PI * distance;
+            arg.sin() / arg
+        };
+        // Hann window over the kernel support keeps the truncation ripple low.
+        let window = if distance.abs() <= HALF as f64 {
+            0.5 * (1.0 + (std::f64::consts::PI * distance / HALF as f64).cos())
+        } else {
+            0.0
+        };
+        acc += x[index as usize] * (window * sinc) as f32;
+    }
+    acc
+}
+
+/// Quantise the segment-rate waveform to `u8` I/Q as if the RTL-SDR sample
+/// clock ran `sfo_ppm` parts-per-million off its nominal 1.2 MHz.
+///
+/// The receiver resamples the 1.2 MHz input to the one-segment rate with the
+/// fixed ratio `160/189`. A hardware clock
+/// `1.2e6 * (1 + sfo_ppm * 1e-6)` therefore presents the receiver with the
+/// segment-rate waveform resampled by `1 / (1 + sfo_ppm * 1e-6)`: output sample
+/// `m` lands at segment-waveform position
+/// `m * (160/189) / (1 + sfo_ppm * 1e-6)`, which [`sample_windowed_sinc`]
+/// evaluates. This is a continuous fractional time-warp of the whole capture,
+/// not a per-frame sample insert.
+///
+/// The end-of-stream zero pad is the same computed resampler flush as the
+/// nominal path ([`resampler_flush_pad_samples`]), so the receiver's FIR still
+/// drains the final symbol.
+fn quantize_to_u8_iq_at_clock(segment: &[Complex32], sfo_ppm: f64) -> Vec<u8> {
+    let pad = resampler_flush_pad_samples();
+    let mut flushed = Vec::with_capacity(segment.len() + pad);
+    flushed.extend_from_slice(segment);
+    flushed.resize(segment.len() + pad, Complex32::new(0.0, 0.0));
+
+    let ratio = (160.0 / 189.0) / (1.0 + sfo_ppm * 1e-6);
+    // Keep the final kernel half-width away from the padded end so the last
+    // output sample never reads past the zero pad.
+    let usable = flushed.len() as f64 - 16.0;
+    let out_len = (usable / ratio).floor().max(0.0) as usize;
+    let mut baseband = Vec::with_capacity(out_len);
+    for m in 0..out_len {
+        baseband.push(sample_windowed_sinc(&flushed, m as f64 * ratio));
+    }
+    quantize_baseband_to_u8(&baseband)
 }
 
 /// Apply a carrier-frequency offset of `bins` subcarriers to a segment-rate
@@ -780,6 +860,53 @@ fn raw_iq_integer_plus_fractional_cfo_decodes_contiguous_ts() {
     }
 }
 
+/// Raw-IQ replay with a **relative sample-clock offset (SFO)** between the
+/// transmitter fixture and the receiver, the practical failure mode of an
+/// RTL-SDR whose crystal runs a few tens of ppm off nominal.
+///
+/// The fixture is the same 8-frame QPSK 1/2 `I = 0` stream used by
+/// [`raw_iq_replay_decodes_exact_contiguous_ts`]. [`quantize_to_u8_iq_at_clock`]
+/// warps the 1.2 MHz sampling grid by `ppm` before `u8` quantisation, so the
+/// receiver's fixed `160/189` resampler produces a segment-rate waveform whose
+/// symbol timing drifts monotonically. No samples are inserted or dropped per
+/// symbol: the drift accumulates continuously and the synchroniser must follow
+/// it with its timing tracker.
+///
+/// Both signs and a larger offset are exercised. The recovered TS must still be
+/// the exact contiguous transmitted run, with TMCC validating at least five
+/// frames, so this pins the coherent-channel / equaliser behaviour under a
+/// growing timing offset rather than merely "something locks".
+#[test]
+fn raw_iq_sample_clock_offset_decodes_contiguous_ts() {
+    let frames = 8usize;
+    let per_frame = packets_per_frame(MODE, MODULATION, RATE);
+    let packets = build_ts_packets(frames * per_frame);
+    let carriers = cached_carriers(frames, 0);
+    let waveform = synthesize_waveform(&carriers);
+
+    for &ppm in &[0.0f64, 20.0, -20.0, 50.0, -50.0] {
+        let iq = quantize_to_u8_iq_at_clock(&waveform, ppm);
+        let (decoded, stats) = decode_raw_iq(&iq, 4096, false);
+        eprintln!(
+            "raw-IQ SFO {ppm:+} ppm (chunk 4096): stats={stats:?} ts_packets={}",
+            decoded.len()
+        );
+
+        assert!(
+            stats.tmcc_frames >= 5,
+            "raw-IQ SFO {ppm:+} ppm: only {} validated TMCC frames (want >= 5); stats={stats:?}",
+            stats.tmcc_frames
+        );
+        assert!(
+            decoded.len() >= 3 * per_frame,
+            "raw-IQ SFO {ppm:+} ppm: only {} TS packets (< 3 frames = {}); stats={stats:?}",
+            decoded.len(),
+            3 * per_frame
+        );
+        assert_contiguous(&decoded, &packets, &format!("raw-IQ SFO {ppm:+} ppm"), 0);
+    }
+}
+
 /// Fragmented input must decode identically to a single `push_iq` call.
 #[test]
 fn chunked_raw_iq_replay_matches_single_push() {
@@ -918,4 +1045,122 @@ fn raw_iq_time_interleave_i1_decodes_contiguous_ts() {
         3 * per_frame
     );
     assert_contiguous(&decoded, &packets, "raw-IQ I=1", 1);
+}
+
+/// Sustained-stability regression: 48 frames of QPSK 1/2 `I = 1` with a
+/// **concurrent** `+20 ppm` sample-clock offset and `+3.2`-bin RF carrier
+/// offset, fed in 8192-byte chunks.
+///
+/// The short SFO/CFO tests pin acquisition and a few seconds of tracking; this
+/// one is deliberately long enough (`~11 s` at 1.2 MHz) that a slow timing /
+/// carrier drift or a TS-less stall would surface. The front-end injection is
+/// the existing continuous fractional time-warp ([`quantize_to_u8_iq_at_clock`],
+/// applied after [`apply_cfo_bins`]), so the drift accumulates over the whole
+/// capture rather than being reset per frame.
+///
+/// Per-second TS output is tracked on the input byte offset. Acquisition may
+/// cost the first second; after that *every* second must carry TS, and the last
+/// quarter must be active, which is what catches a late `resets_ts_stall` or a
+/// silent lock loss. A single coarse-CFO generation bump is allowed (as in
+/// [`raw_iq_integer_plus_fractional_cfo_decodes_contiguous_ts`]); more resets
+/// are thrash. The recovered run must still be the whole exact contiguous
+/// transmitted sequence via [`assert_contiguous`] with the `I = 1` tail.
+///
+/// # Runtime
+///
+/// The 48-frame fixture plus the windowed-sinc resample over the full capture
+/// is intentionally heavy, so the test is `#[ignore]`d and run explicitly in
+/// release:
+///
+/// ```text
+/// cargo test --release raw_iq_sustained_sfo_plus_cfo_decodes_contiguous_ts \
+///     -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "long-running stability regression; run release explicitly"]
+fn raw_iq_sustained_sfo_plus_cfo_decodes_contiguous_ts() {
+    const FRAMES: usize = 48;
+    const SFO_PPM: f64 = 20.0;
+    const CFO_BINS: f32 = 3.2;
+    const CHUNK_BYTES: usize = 8192;
+    /// 1.2 MHz, two bytes per complex sample.
+    const BYTES_PER_SECOND: usize = DEFAULT_INPUT_RATE as usize * 2;
+
+    let per_frame = packets_per_frame(MODE, MODULATION, RATE);
+    let packets = build_ts_packets(FRAMES * per_frame);
+    let carriers = cached_carriers(FRAMES, 1);
+
+    // Concurrent front-end impairments: RF CFO first (segment waveform), then
+    // the sample-clock warp at quantisation, exactly as the short tests do.
+    let mut waveform = synthesize_waveform(&carriers);
+    apply_cfo_bins(&mut waveform, CFO_BINS);
+    let iq = quantize_to_u8_iq_at_clock(&waveform, SFO_PPM);
+
+    let seconds = iq.len() as f64 / BYTES_PER_SECOND as f64;
+    let buckets = iq.len().div_ceil(BYTES_PER_SECOND);
+    let mut per_second_packets = vec![0usize; buckets];
+
+    let mut decoder = Decoder::new(DEFAULT_INPUT_RATE).expect("1.2 MHz is supported");
+    let mut decoded = Vec::new();
+    let mut cursor = 0usize;
+    for chunk in iq.chunks(CHUNK_BYTES) {
+        let output = decoder
+            .push_iq(chunk, false)
+            .unwrap_or_else(|error| panic!("push_iq failed: {error}"));
+        per_second_packets[cursor / BYTES_PER_SECOND] += output.len();
+        decoded.extend(output);
+        cursor += chunk.len();
+    }
+    let stats = decoder.stats();
+
+    eprintln!(
+        "raw-IQ sustained {FRAMES} frames (~{seconds:.2} s) SFO {SFO_PPM:+} ppm + CFO {CFO_BINS:+} bins \
+         (chunk {CHUNK_BYTES}): stats={stats:?} ts_packets={} per_second={per_second_packets:?}",
+        decoded.len()
+    );
+
+    assert!(
+        stats.gaps == 0 && stats.resets_gap == 0,
+        "sustained: unexpected gap; stats={stats:?}"
+    );
+    assert_eq!(
+        stats.resets_ts_stall, 0,
+        "sustained: TS-less stall under continuous input; stats={stats:?}"
+    );
+    // A nonzero integer/subcarrier CFO is corrected once during acquisition.
+    assert!(
+        stats.resets <= 1,
+        "sustained: reset thrash ({} resets, {} sync); stats={stats:?}",
+        stats.resets,
+        stats.resets_sync
+    );
+    assert!(
+        stats.tmcc_frames >= FRAMES as u64 - 2,
+        "sustained: only {} validated TMCC frames (want >= {}); stats={stats:?}",
+        stats.tmcc_frames,
+        FRAMES - 2
+    );
+
+    // Acquisition may clear the first second; afterwards every second of input
+    // must produce TS, and the final quarter must be active (no late stall).
+    for (second, &count) in per_second_packets.iter().enumerate().skip(1) {
+        assert!(
+            count > 0,
+            "sustained: no TS in second {second} (stall); per_second={per_second_packets:?}"
+        );
+    }
+    let last_quarter = buckets * 3 / 4;
+    let late_packets: usize = per_second_packets[last_quarter..].iter().sum();
+    assert!(
+        late_packets > 0,
+        "sustained: final quarter produced no TS; per_second={per_second_packets:?}"
+    );
+
+    assert!(
+        decoded.len() >= 3 * per_frame,
+        "sustained: only {} TS packets (< 3 frames = {}); stats={stats:?}",
+        decoded.len(),
+        3 * per_frame
+    );
+    assert_contiguous(&decoded, &packets, "raw-IQ sustained SFO+CFO", 1);
 }

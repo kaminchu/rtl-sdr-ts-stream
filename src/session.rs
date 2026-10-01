@@ -26,6 +26,7 @@
 //! Dropping the response body closes the channel, which the worker observes and
 //! treats as client disconnect.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,6 +96,40 @@ impl StreamState {
             StreamState::Reacquiring => "reacquiring",
             StreamState::Stopping => "stopping",
             StreamState::Error => "error",
+        }
+    }
+}
+
+/// Emit one non-panicking lifecycle timing diagnostic on stderr.
+///
+/// Hardware bring-up needs to separate *tuning* (device open / configure) from
+/// *locking* (waiting for the first valid TS) and *stopping* (cancel, join,
+/// close). This writes one stable, generic line per begin/end marker so a
+/// hardware test can parse elapsed milliseconds per phase:
+///
+/// ```text
+/// ts-stream: phase=<phase> state=<state> event=<begin|end> [elapsed_ms=<n>]
+/// ```
+///
+/// stdout is reserved for CLI output, so diagnostics always go to stderr. The
+/// write result is ignored: a broken stderr must never panic a backend call or
+/// the worker thread while a receiver is live.
+fn log_phase(state: StreamState, phase: &str, event: &str, elapsed: Option<Duration>) {
+    match elapsed {
+        Some(elapsed) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ts-stream: phase={phase} state={} event={event} elapsed_ms={}",
+                state.as_str(),
+                elapsed.as_millis(),
+            );
+        }
+        None => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "ts-stream: phase={phase} state={} event={event}",
+                state.as_str(),
+            );
         }
     }
 }
@@ -613,11 +648,20 @@ impl<B: Backend> Worker<B> {
     fn cleanup(&mut self) {
         self.set_state(StreamState::Stopping);
         if let Some(mut receiver) = self.receiver.take() {
+            log_phase(StreamState::Stopping, "receiver-stop", "begin", None);
+            let started = Instant::now();
             if let Err(error) = receiver.stop() {
                 eprintln!("ts-stream: receiver stop during cleanup failed: {error}");
             }
             // `receiver` is dropped here, still on this worker thread and still
             // before the thread exits, so the destructor is part of the join.
+            drop(receiver);
+            log_phase(
+                StreamState::Stopping,
+                "receiver-stop",
+                "end",
+                Some(started.elapsed()),
+            );
         }
     }
 }
@@ -926,9 +970,9 @@ impl<B: Backend> SessionManager<B> {
 
 /// Production glue over [`crate::rtl`] and [`crate::demod::receiver`].
 pub mod rtl_backend {
-    use super::{Backend, BackendError, DeviceInfo, OpenRequest, RxEvent, TsReceiver};
+    use super::{Backend, BackendError, DeviceInfo, OpenRequest, RxEvent, StreamState, TsReceiver};
     use std::io::Write;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::demod::receiver::{Decoder, ReceiverError};
     use crate::rtl::{IqBlock, RtlError, RtlLibrary};
@@ -941,6 +985,13 @@ pub mod rtl_backend {
     /// long time, so the adapter retains the remainder and decodes it in bounded
     /// batches instead.
     const MAX_FEED_BYTES: usize = 8192;
+
+    /// A single decode batch slower than this is worth one diagnostic line.
+    ///
+    /// Normal batches are sub-millisecond; logging every batch would flood the
+    /// hardware-test log. This is purely observational and never widens a
+    /// session deadline.
+    const SLOW_BATCH_LOG_THRESHOLD: Duration = Duration::from_millis(100);
 
     /// Blocking source of raw interleaved `u8` IQ blocks.
     ///
@@ -985,28 +1036,12 @@ pub mod rtl_backend {
                 RtlLibrary::load().map_err(|error| BackendError::Unavailable(error.to_string()))?;
             Ok(Self { library })
         }
-    }
 
-    impl Backend for RtlBackend {
-        type Receiver = RtlReceiver;
-
-        fn list_devices(&self) -> Result<Vec<DeviceInfo>, BackendError> {
-            self.library
-                .devices()
-                .map(|devices| {
-                    devices
-                        .into_iter()
-                        .map(|device| DeviceInfo {
-                            index: device.index,
-                            name: device.name,
-                            serial: device.serial,
-                        })
-                        .collect()
-                })
-                .map_err(|error| BackendError::Unavailable(error.to_string()))
-        }
-
-        fn open(&self, request: OpenRequest) -> Result<RtlReceiver, BackendError> {
+        /// Open/configure the device and build the adapter.
+        ///
+        /// Split out of [`Backend::open`] so the timing begin/end markers wrap
+        /// every return path without duplicating the error handling.
+        fn open_configured(&self, request: OpenRequest) -> Result<RtlReceiver, BackendError> {
             // Validate and build the demodulator *before* opening the device, so
             // an unsupported sample rate fails without touching hardware.
             let decoder = Decoder::new(request.sample_rate).map_err(|error| {
@@ -1035,6 +1070,42 @@ pub mod rtl_backend {
                 pending_gap: false,
                 had_ts: false,
             })
+        }
+    }
+
+    impl Backend for RtlBackend {
+        type Receiver = RtlReceiver;
+
+        fn list_devices(&self) -> Result<Vec<DeviceInfo>, BackendError> {
+            self.library
+                .devices()
+                .map(|devices| {
+                    devices
+                        .into_iter()
+                        .map(|device| DeviceInfo {
+                            index: device.index,
+                            name: device.name,
+                            serial: device.serial,
+                        })
+                        .collect()
+                })
+                .map_err(|error| BackendError::Unavailable(error.to_string()))
+        }
+
+        fn open(&self, request: OpenRequest) -> Result<RtlReceiver, BackendError> {
+            // Timing markers separate device open/configure (tuning) from the
+            // initial lock wait (locking). The end marker is emitted on both the
+            // success and failure paths.
+            super::log_phase(StreamState::Tuning, "backend-open", "begin", None);
+            let started = Instant::now();
+            let result = self.open_configured(request);
+            super::log_phase(
+                StreamState::Tuning,
+                "backend-open",
+                "end",
+                Some(started.elapsed()),
+            );
+            result
         }
     }
 
@@ -1109,7 +1180,28 @@ pub mod rtl_backend {
                 self.pending_pos = 0;
             }
 
-            let packets = match self.decoder.push_iq(&batch, gap) {
+            // Time only the decoder call itself. A slow batch is surfaced once,
+            // with the batch size and the decoder's cumulative sample counters,
+            // so a hardware run can locate a stall without per-batch noise.
+            let batch_bytes = batch.len();
+            let decode_started = Instant::now();
+            let decoded = self.decoder.push_iq(&batch, gap);
+            let decode_elapsed = decode_started.elapsed();
+            if decode_elapsed > SLOW_BATCH_LOG_THRESHOLD {
+                let stats = self.decoder.stats();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ts-stream: slow ISDB-T batch elapsed_ms={} batch_bytes={} input_bytes={} \
+                     input_samples={} resampled_samples={}",
+                    decode_elapsed.as_millis(),
+                    batch_bytes,
+                    stats.input_bytes,
+                    stats.input_samples,
+                    stats.resampled_samples,
+                );
+            }
+
+            let packets = match decoded {
                 Ok(packets) => packets,
                 Err(ReceiverError::DqpskUnsupported) => {
                     self.had_ts = false;
@@ -1168,13 +1260,19 @@ pub mod rtl_backend {
 
         /// Best-effort decoder diagnostics. A failed write is ignored so a
         /// broken stderr can never panic the worker thread.
+        ///
+        /// The lifetime counters include every reset class (notably
+        /// `ts_stall`); the separate `sync` line is the *current* CP-lock
+        /// snapshot, so a hardware run can tell "never locked" (`cp_locked=0
+        /// mode=None`) apart from "CP locked but no TS" and can read the SFO
+        /// trend from `timing_offset`.
         fn log_stats(&self) {
             let stats = self.decoder.stats();
             let _ = writeln!(
                 std::io::stderr(),
                 "ts-stream: isdb-t stats input_bytes={} samples={} resampled={} gaps={} \
                  tmcc_frames={} ts_packets={} resets={} (gap={} sync={} config={} \
-                 tmcc_timeout={})",
+                 tmcc_timeout={} ts_stall={})",
                 stats.input_bytes,
                 stats.input_samples,
                 stats.resampled_samples,
@@ -1186,6 +1284,22 @@ pub mod rtl_backend {
                 stats.resets_sync,
                 stats.resets_config,
                 stats.resets_tmcc_timeout,
+                stats.resets_ts_stall,
+            );
+
+            let diagnostics = self.decoder.diagnostics();
+            let _ = writeln!(
+                std::io::stderr(),
+                "ts-stream: isdb-t sync cp_locked={} mode={:?} guard={:?} generation={} \
+                 losses={} integer_bins={:?} cfo={:?} timing_offset={:?}",
+                diagnostics.cp_locked,
+                diagnostics.mode,
+                diagnostics.guard,
+                diagnostics.generation,
+                diagnostics.losses,
+                diagnostics.integer_bins,
+                diagnostics.cfo,
+                diagnostics.timing_offset,
             );
         }
     }
@@ -1220,6 +1334,11 @@ pub mod rtl_backend {
         }
 
         fn stop(&mut self) -> Result<(), BackendError> {
+            // Emit the final decoder snapshot *before* closing the source, so a
+            // hardware test can still observe IQ/sample/sync-reset/TMCC/TS/gap
+            // counters even when the lock never succeeded and no TS flowed.
+            // Best-effort: a broken stderr must not fail teardown.
+            self.log_stats();
             if let Some(mut source) = self.source.take() {
                 source.stop()?;
             }
@@ -1367,6 +1486,31 @@ pub mod rtl_backend {
             receiver.stop().expect("first stop");
             receiver.stop().expect("second stop");
             assert!(receiver.source.is_none());
+        }
+
+        #[test]
+        fn stop_after_processing_is_idempotent_and_keeps_processed_samples() {
+            let mut receiver = receiver_with(FakeIqSource::blocks(vec![IqBlock {
+                samples: vec![128u8; 4096],
+                gap: false,
+            }]));
+
+            // Process one whole fake block so the decoder has real progress to
+            // report; silence produces no lock, so the event stays pending.
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_millis(1)).unwrap(),
+                RxEvent::Pending
+            );
+            let processed = receiver.decoder.stats();
+            assert_eq!(processed.input_bytes, 4096);
+            assert_eq!(processed.input_samples, 2048);
+
+            // `stop` logs that final snapshot, tears the source down and stays
+            // idempotent without changing the decoder counters.
+            receiver.stop().expect("first stop");
+            receiver.stop().expect("second stop");
+            assert!(receiver.source.is_none());
+            assert_eq!(receiver.decoder.stats().input_samples, 2048);
         }
     }
 }

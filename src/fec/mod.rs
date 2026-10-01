@@ -452,6 +452,49 @@ fn k7_transition(state: u8, input: u8) -> (u8, u8, u8) {
     (next_state, out1, out2)
 }
 
+/// Renormalise cumulative path metrics so the best finite value is exactly
+/// `0.0`.
+///
+/// Path metrics are cumulative sums of soft branch values, so they grow without
+/// bound over a long block (or, in `crate::demod::coding`, a long stream). Once
+/// the magnitude approaches the precision limit, adding a soft value to two
+/// nearly-equal survivors rounds both to the same value and the decoder can no
+/// longer separate them. Subtracting the maximum finite metric every ACS step
+/// keeps the finite window bounded independently of the number of steps while
+/// preserving the relative ordering, so the same survivor is selected.
+/// `NEG_INFINITY` marks an unreachable state and is left untouched.
+///
+/// Metrics are held as `f64` even though soft values are `f32`. The largest
+/// finite soft value is `f32::MAX`, and the spread of one ACS step's candidates
+/// is bounded by a small multiple of it; a worst-case K=7 merge-window spread
+/// is around `1e41`, far inside the `f64` range but already overflowing `f32`.
+/// Casting to `f64` before the branch sum therefore keeps every finite `f32`
+/// input well-defined with no arithmetic clamp on the public API.
+fn renormalise_metrics(metrics: &mut [f64; K7_STATES]) {
+    let mut maximum = f64::NEG_INFINITY;
+    for &value in metrics.iter() {
+        if value > maximum {
+            maximum = value;
+        }
+    }
+    if !maximum.is_finite() {
+        return;
+    }
+    for value in metrics.iter_mut() {
+        if value.is_finite() {
+            *value -= maximum;
+        }
+    }
+    debug_assert!(
+        metrics.iter().all(|&value| value <= 0.0),
+        "renormalised metrics must be non-positive"
+    );
+    debug_assert!(
+        metrics.contains(&0.0),
+        "the best reachable state must renormalise to zero"
+    );
+}
+
 /// K=7 rate-1/2 convolutional encoder.
 ///
 /// The 6-bit state holds the last six input bits, with the most recent bit in
@@ -522,19 +565,21 @@ fn k7_viterbi(soft: &[f32], final_state: Option<u8>) -> Result<Vec<u8>, FecError
         return Err(FecError::ViterbiTooLarge(steps));
     }
 
-    let mut metrics = [f32::NEG_INFINITY; K7_STATES];
+    let mut metrics = [f64::NEG_INFINITY; K7_STATES];
     metrics[0] = 0.0;
     let mut trace: Vec<[u8; K7_STATES]> = vec![[0u8; K7_STATES]; steps];
 
     for step in 0..steps {
-        let soft0 = soft[2 * step];
-        let soft1 = soft[2 * step + 1];
-        let mut next = [f32::NEG_INFINITY; K7_STATES];
+        // Widen before the branch sum so even `f32::MAX` inputs cannot overflow
+        // the accumulator; see `renormalise_metrics`.
+        let soft0 = f64::from(soft[2 * step]);
+        let soft1 = f64::from(soft[2 * step + 1]);
+        let mut next = [f64::NEG_INFINITY; K7_STATES];
         let mut predecessor = [0u8; K7_STATES];
 
         for state in 0..K7_STATES as u8 {
             let base = metrics[state as usize];
-            if base == f32::NEG_INFINITY {
+            if base == f64::NEG_INFINITY {
                 continue;
             }
             for input in 0..2u8 {
@@ -550,6 +595,7 @@ fn k7_viterbi(soft: &[f32], final_state: Option<u8>) -> Result<Vec<u8>, FecError
             }
         }
 
+        renormalise_metrics(&mut next);
         metrics = next;
         trace[step] = predecessor;
     }
@@ -558,7 +604,7 @@ fn k7_viterbi(soft: &[f32], final_state: Option<u8>) -> Result<Vec<u8>, FecError
         Some(state) => state,
         None => {
             let mut best_state = 0u8;
-            let mut best_metric = f32::NEG_INFINITY;
+            let mut best_metric = f64::NEG_INFINITY;
             for (index, &metric) in metrics.iter().enumerate() {
                 if metric > best_metric {
                     best_metric = metric;
@@ -798,24 +844,63 @@ pub const RS204_188_DATA: usize = 188;
 /// Codeword length of RS(204, 188).
 pub const RS204_188_TOTAL: usize = RS204_188_DATA + RS204_188_PARITY;
 
+/// Build the antilog table `exp[i] = alpha^i`.
+///
+/// `alpha = 2` is a primitive element of `GF(2^8)`, so `exp[0..255]` enumerates
+/// every nonzero element exactly once and the sequence then repeats with period
+/// 255. The table is doubled to `512` entries so two logarithms can be summed
+/// and used directly as an index without a conditional reduction.
+const fn build_gf_exp() -> [u8; 512] {
+    let mut exp = [0u8; 512];
+    let mut value = 1u8;
+    let mut i = 0;
+    while i < 255 {
+        exp[i] = value;
+        let high = value & 0x80;
+        value <<= 1;
+        if high != 0 {
+            value ^= (RS_PRIMITIVE_POLY & 0xFF) as u8;
+        }
+        i += 1;
+    }
+    // `alpha^255 == alpha^0 == 1`; repeat the period to fill the doubling.
+    let mut i = 255;
+    while i < 512 {
+        exp[i] = exp[i - 255];
+        i += 1;
+    }
+    exp
+}
+
+/// Antilog table `alpha^i` for `i = 0..=511` (see [`build_gf_exp`]).
+const GF_EXP: [u8; 512] = build_gf_exp();
+
+/// Build the logarithm table inverse to [`GF_EXP`]: `log[v]` is the exponent
+/// with `alpha^log[v] == v` for every nonzero `v`; `log[0]` is unused and left 0.
+const fn build_gf_log() -> [u8; 256] {
+    let mut log = [0u8; 256];
+    let mut i = 0;
+    while i < 255 {
+        log[GF_EXP[i] as usize] = i as u8;
+        i += 1;
+    }
+    log
+}
+
+/// Logarithm table inverse to [`GF_EXP`].
+const GF_LOG: [u8; 256] = build_gf_log();
+
 /// Multiply two field elements modulo [`RS_PRIMITIVE_POLY`].
 ///
-/// Implemented as carry-less ("Russian peasant") multiplication; correctness is
-/// preferred over speed here.
-pub fn gf_mul(mut a: u8, mut b: u8) -> u8 {
-    let mut product = 0u8;
-    for _ in 0..8 {
-        if b & 1 != 0 {
-            product ^= a;
-        }
-        let high = a & 0x80;
-        a <<= 1;
-        if high != 0 {
-            a ^= (RS_PRIMITIVE_POLY & 0xFF) as u8;
-        }
-        b >>= 1;
+/// Uses the compile-time log/antilog tables: `a * b = alpha^(log a + log b)`.
+/// The hot Reed-Solomon syndrome loop performs one table lookup per byte, which
+/// dominates the acquisition and decode cost on real captures.
+pub fn gf_mul(a: u8, b: u8) -> u8 {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        GF_EXP[GF_LOG[a as usize] as usize + GF_LOG[b as usize] as usize]
     }
-    product
 }
 
 /// Raise `a` to the power `exponent` in `GF(2^8)`.
@@ -836,8 +921,8 @@ pub fn gf_inv(a: u8) -> u8 {
     if a == 0 {
         0
     } else {
-        // The multiplicative group has order 255.
-        gf_pow(a, 254)
+        // The multiplicative group has order 255: `a^-1 = alpha^(255 - log a)`.
+        GF_EXP[255 - GF_LOG[a as usize] as usize]
     }
 }
 
@@ -884,7 +969,8 @@ fn rs_parity(data: &[u8]) -> [u8; RS204_188_PARITY] {
 fn rs_syndromes(block: &[u8]) -> [u8; RS204_188_PARITY] {
     let mut syndromes = [0u8; RS204_188_PARITY];
     for (i, slot) in syndromes.iter_mut().enumerate() {
-        let x = gf_pow(2, i as u32);
+        // `alpha = 2` and `i < 16`, so the root is a direct antilog lookup.
+        let x = GF_EXP[i];
         let mut acc = 0u8;
         for &coefficient in block {
             acc = gf_mul(acc, x) ^ coefficient;
@@ -1021,16 +1107,24 @@ pub fn rs204_188_decode(block: &[u8]) -> Result<Vec<u8>, FecError> {
         return Err(FecError::RsUncorrectable);
     }
 
-    // Chien search over the shortened codeword positions.
+    // Chien search over the shortened codeword positions. `alpha_inverse^l`
+    // and `alpha^l` are advanced by one multiplication per step instead of a
+    // fresh exponentiation, which removes ~3 000 field multiplications from
+    // every attempted correction.
     let alpha_inverse = gf_inv(2);
     let mut positions = Vec::with_capacity(error_count);
     let mut locators = Vec::with_capacity(error_count);
+    let mut x_inverses = Vec::with_capacity(error_count);
+    let mut x_inverse = 1u8;
+    let mut x = 1u8;
     for l in 0..RS204_188_TOTAL {
-        let x_inverse = gf_pow(alpha_inverse, l as u32);
         if poly_eval(&locator, x_inverse) == 0 {
             positions.push(RS204_188_TOTAL - 1 - l);
-            locators.push(gf_pow(2, l as u32));
+            locators.push(x);
+            x_inverses.push(x_inverse);
         }
+        x_inverse = gf_mul(x_inverse, alpha_inverse);
+        x = gf_mul(x, 2);
     }
     if positions.len() != error_count {
         return Err(FecError::RsUncorrectable);
@@ -1048,9 +1142,9 @@ pub fn rs204_188_decode(block: &[u8]) -> Result<Vec<u8>, FecError> {
         }
     }
 
-    for (&position, &locator_value) in positions.iter().zip(locators.iter()) {
-        let l = RS204_188_TOTAL - 1 - position;
-        let x_inverse = gf_pow(alpha_inverse, l as u32);
+    for ((&position, &locator_value), &x_inverse) in
+        positions.iter().zip(locators.iter()).zip(x_inverses.iter())
+    {
         let numerator = poly_eval(&evaluator, x_inverse);
         let denominator = poly_eval(&derivative, x_inverse);
         if denominator == 0 {
@@ -1355,6 +1449,45 @@ mod tests {
         assert_eq!(decode_k7_soft_best_end(&soft).unwrap(), data);
     }
 
+    /// `f32::MAX` is the largest value the block API accepts. An ACS sum of two
+    /// such values overflows `f32` to `+inf`; the `f64` accumulator must keep
+    /// the decode well-defined and still recover the encoder input exactly,
+    /// because sign (not magnitude) carries the decision.
+    #[test]
+    fn k7_viterbi_decodes_max_finite_magnitude() {
+        let mut state = 0x7A31_0C9Du32;
+        let bits: Vec<u8> = (0..120).map(|_| (xorshift(&mut state) & 1) as u8).collect();
+        let mut framed = bits.clone();
+        framed.extend_from_slice(&[0u8; 6]); // tail to state 0
+
+        let mut encoder = K7Encoder::new();
+        let encoded = encoder.encode(&framed);
+        let soft: Vec<f32> = encoded
+            .iter()
+            .map(|&bit| if bit == 0 { f32::MAX } else { -f32::MAX })
+            .collect();
+
+        assert_eq!(decode_k7_soft(&soft).unwrap(), framed);
+    }
+
+    /// The renormalisation helper is `f64` and keeps the "unreachable" marker
+    /// semantics: finite metrics are shifted so the best is exactly `0.0`, while
+    /// `NEG_INFINITY` states are preserved untouched.
+    #[test]
+    fn renormalise_metrics_zeroes_best_and_preserves_unreachable() {
+        let mut metrics = [f64::NEG_INFINITY; K7_STATES];
+        metrics[0] = 5.0;
+        metrics[1] = -3.0;
+        metrics[2] = 5.0;
+        renormalise_metrics(&mut metrics);
+        assert_eq!(metrics[0], 0.0);
+        assert_eq!(metrics[2], 0.0);
+        assert_eq!(metrics[1], -8.0);
+        for &metric in metrics.iter().skip(3) {
+            assert_eq!(metric, f64::NEG_INFINITY);
+        }
+    }
+
     // ---- puncturing ------------------------------------------------------
 
     #[test]
@@ -1457,6 +1590,33 @@ mod tests {
     }
 
     // ---- Reed-Solomon ----------------------------------------------------
+
+    /// The log/antilog tables must be bit-for-bit identical to the original
+    /// carry-less multiplier for every one of the 65 536 operand pairs. This
+    /// pins the optimisation to the definition instead of trusting the tables.
+    #[test]
+    fn gf_mul_table_matches_carryless_reference() {
+        fn reference(mut a: u8, mut b: u8) -> u8 {
+            let mut product = 0u8;
+            for _ in 0..8 {
+                if b & 1 != 0 {
+                    product ^= a;
+                }
+                let high = a & 0x80;
+                a <<= 1;
+                if high != 0 {
+                    a ^= (RS_PRIMITIVE_POLY & 0xFF) as u8;
+                }
+                b >>= 1;
+            }
+            product
+        }
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                assert_eq!(gf_mul(a, b), reference(a, b), "gf_mul({a}, {b})");
+            }
+        }
+    }
 
     #[test]
     fn gf256_basic_identities() {

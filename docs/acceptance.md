@@ -1,8 +1,9 @@
 # 受入手順と判定基準
 
 - 対象: `ts-stream`（RTL-SDR / ISDB-T ワンセグ / TS HTTP ストリーマ）
-- 基準日: 2026-09-30
-- 関連: `plans/実装計画.md` §9・§10、`docs/implementation-status.md`
+- 基準日: 2026-10-01
+- 関連: `plans/実装計画.md` §9・§10、`docs/implementation-status.md`、
+  [`stability.md`](stability.md)、[`hardware-n100.md`](hardware-n100.md)
 
 ## 0. 原則
 
@@ -14,8 +15,10 @@
 - **禁止:** Python / GNU Radio / gr-isdb を build 時・実行時・テスト時のいずれの
   依存・ツールとしても用いない。受入は Rust の `cargo`・`curl`・シェルのみで行う。
 - 本番経路はダミー TS を出さない。`tests/` のモックは本番バイナリに含まれない。
-- **全テスト成功を前提にしない。** 2026-09-30 時点で raw IQ replay の 1 本が失敗
-  しています（[`docs/implementation-status.md`](implementation-status.md) §1）。
+- **全テスト成功を前提にしない。** 2026-10-01 の release full suite は
+  **241 passed / 0 failed / 1 ignored**、明示実行した長時間 ignore テストは
+  **1 passed** です（[`stability.md`](stability.md) §6）。ただし Debug profile の
+  full suite は再実行しておらず、独立録画 RF・実機受入の合格を意味しません。
 
 ## 1. 使用ツール
 
@@ -42,21 +45,23 @@ cargo check --target aarch64-unknown-linux-gnu --lib   # コンパイル確認�
 cargo test --release --lib demod::replay_tests -- --test-threads=1
 ```
 
-期待（2026-09-30 時点の実測）:
+期待（2026-10-01 時点の実測）:
 
 - `cargo test --release --lib demod::replay_tests -- --test-threads=1`:
-  **7 テスト中 6 成功・1 失敗**。失敗は
-  `raw_iq_replay_decodes_exact_contiguous_ts`（TMCC 4、TS 179 に対し
-  `tmcc_frames >= 5` assertion）。fixture / 取得条件の修正が進行中。
-  - 成功側の観測: carrier レベル 6 フレームで TMCC 5 / TS 227、carrier レベル
-    I=1 8 フレームで TMCC 7 / TS 314、chunked（4097 / 8191 / 3 byte）が単一 push
-    と一致、gap 10 フレームで `resets_gap=1` の後に再取得。
-- `cargo fmt --check` / `cargo check --all-targets` / `cargo test` /
-  `cargo clippy --all-targets -- -D warnings` / `cargo build --release`:
-  **修正完了後に再実行**する。過去の成功を現在の成功として流用しない。
-- `cargo check --target aarch64-unknown-linux-gnu --lib`: 以前は成功を観測。
-  ただし**コンパイル確認のみ**で実行時検証ではない。
-- RTL-SDR は列挙されず、実機受信は未実施。ARM 実機上での実行も未実施。
+  **10 テスト中 9 成功・1 ignore**。合成 replay の SFO 追随と長時間 ignore の内容は
+  [`stability.md`](stability.md) §3–§4 を参照。旧版の失敗
+  （`raw_iq_replay_decodes_exact_contiguous_ts`、TMCC 4 / TS 179）は履歴である。
+- `cargo fmt --check` / `cargo check --all-targets` /
+  `cargo clippy --all-targets -- -D warnings` / `cargo test --release`:
+  **241 passed / 0 failed / 1 ignored**、明示実行した長時間 ignore テストは
+  **1 passed**（[`stability.md`](stability.md) §6）。
+- Debug profile の full suite は再実行していない。**Debug での全成功は主張しない。**
+- `cargo check --target aarch64-unknown-linux-gnu --lib`: 成功を観測。ただし
+  **コンパイル確認のみ**で実行時検証ではない。ARM 実機上での実行は未実施。
+- 実機（N100）では USB 受信・HTTP の再試験を実施。1 回の HTTP `200` は過去に観測
+  したが、現在の live は `504`。録画 IQ 3 秒（7200000 byte）は
+  **608 TS / 114304 byte** まで decode 済み
+  （[`hardware-n100.md`](hardware-n100.md) §2–§4、[`stability.md`](stability.md) §5）。
 
 この受入が検証する範囲:
 
@@ -76,15 +81,20 @@ cargo test --release --lib demod::replay_tests -- --test-threads=1
 
 **検証しない範囲（重要）:**
 
-- **独立した録画 RF 信号 / 既知受信ベクトルは存在せず、検証していない。** 合成
-  replay の成功は実伝搬・実機の証明ではない。
+- **独立した録画 RF 信号 / 既知受信ベクトルはリポジトリの fixture としては存在せず、
+  検証していない。** N100 の 3 秒録画 IQ はリポジトリ外で **608 TS / 114304 byte**
+  まで decode したが、独立録画 RF による CRC・continuity の独立検証は未完である。
+  合成 replay の成功は実伝搬・実機の証明ではない。
 - **raw DQPSK replay は未検証**（fixture は QPSK 同期変調のみ）。DQPSK のコードは
   統合済みだが、raw 経路での確認は残る。
 - 実機の実時間性能 / CPU / RSS / 30 分連続は未測定。
-- 実機経路での `200 video/mp2t` は未検証（モックと合成 replay のみ）。
+- 実機経路での `200 video/mp2t` は過去に 1 回観測したのみで、現在の live は `504`。
+  安定した連続配信は未検証（主な検証はモックと合成 replay）。
 
-判定: 上記が現状の合成受入。**replay の 1 本が失敗しているため、現時点で合成受入
-は合格ではありません。** 実機なしではこれ以上を主張しない。
+判定: 上記が現状の合成受入。release full suite は
+**241 passed / 0 failed / 1 ignored**、明示実行した長時間 ignore テストは
+**1 passed** であり、**合成受入は合格**です。ただし独立録画 RF・実機受入の代替には
+なりません。
 
 ## 3. B. 実機受入（RTL-SDR 必須・現状は目標未達）
 
@@ -115,12 +125,15 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 - `list-devices`: 実デバイスが 1 行以上（`index=... name=... serial=...`）。
 - `/version`: `200` JSON（例 `{"name":"ts-stream","version":"0.1.0"}`）。
 - `/stream`: 復調器は本番に接続済みなので、実信号でロックすれば
-  `200 video/mp2t` chunked を返す。**実機での 200 は未確認である。**
+  `200 video/mp2t` chunked を返す。**実機での `200` は過去に 1 回観測したのみで、
+  現在の live は CP 同期できず `504` である（安定配信は未確認）。**
   - 信号が無い / ロックできない場合は、既定 10 秒の初期ロック期限後に
     `504 Gateway Timeout` を返す（`503 decoder not implemented` ではない）。
   - `503 Service Unavailable` は `librtlsdr` / デバイス使用不可か、非対応
     サンプルレートのときのみ。
-- 本受入は**未実施**であり、現時点で合格ではありません。
+- 本受入は**未合格**である。N100 で実機試験を実施したが CP 同期できず長時間安定
+  受信は未達。ARM 実機（OrangePi PC2）は未実施
+  （[`hardware-n100.md`](hardware-n100.md) §4、[`stability.md`](stability.md) §5）。
 
 判定: 合否は「エラーコードを返したか」ではなく「**正しい 188 byte TS が得られたか**」
 で判定する。現時点で実機の合格記録は無い。
@@ -138,9 +151,10 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 
 ## 4. C. 最終目標の受入（recorded RF / N100 は未達）
 
-以下は**未実施**です。合成 replay のソフトウェアパイプラインは存在しますが、
-**録画 RF・実機での合格はまだ記録されていません。** 測定条件と生値を記録せずに
-「達成」と書かないこと。
+以下は**未達**です。合成 replay のソフトウェアパイプラインは存在し、N100 の 3 秒
+録画 IQ から **608 TS / 114304 byte** を一度 decode し、実機 HTTP `200` も 1 回
+観測しましたが、**安定した録画 RF・実機での合格はまだ記録されていません。**
+測定条件と生値を記録せずに「達成」と書かないこと。
 
 - 既知ベクトル / 合法な録画 IQ（自作録画、配布権利確認済み）から正しい
   188 byte TS を再現する（CRC・continuity を含む）。replay はテスト内部用途とし、
