@@ -208,6 +208,7 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
 
 | 変数 | 用途 |
 | --- | --- |
+| `TS_STREAM_VERSION` | **ビルド時**に参照。設定されていれば `ts-stream --version` と `/version` の `version` に使われる（`option_env!`）。未設定なら `Cargo.toml` の `version`。 |
 | `TS_STREAM_GIT` | **ビルド時**に参照。設定されていれば `/version` の `git` フィールドに埋め込まれる（`option_env!`）。未設定なら `git` は省略。 |
 
 実行時に参照する環境変数は現時点でありません。
@@ -326,5 +327,66 @@ curl -N "http://127.0.0.1:3000/stream?ch=19"
   この `13..=62` 受理は**後方互換のため維持**し、本ドキュメント作業では変更しない。
   歴史的 `13..62` と現行運用 `13..52` の相違は
   [`docs/standards.md`](docs/standards.md) §3.2 に整理。
+
+## 10. リリースとバイナリ配布
+
+`v0.1.0` のようなタグを push すると、GitHub Actions
+（[`.github/workflows/release.yml`](.github/workflows/release.yml)）が Linux
+x86_64 / aarch64 のネイティブバイナリをビルドし、同名の GitHub Release へ
+アップロードします。手動 trigger はありません（タグがそのままリリースです）。
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+リリース成果物:
+
+| ファイル | アーキテクチャ | ビルド環境 |
+| --- | --- | --- |
+| `ts-stream-x86_64-unknown-linux-gnu.tar.gz` | x86_64 / amd64 | Ubuntu 24.04 (glibc 2.39) |
+| `ts-stream-aarch64-unknown-linux-gnu.tar.gz` | aarch64 / arm64 | Ubuntu 24.04 arm64 (glibc 2.39) |
+| `SHA256SUMS` | — | 上記 2 アーカイブの SHA-256 |
+
+各 tar.gz には実行ファイル `ts-stream` がアーカイブ直下（root）に 1 つだけ入り
+ます。成果物名はタグではなく Rust target で固定しているため、任意のタグ名を
+安全に使えます。ビルドは GNU (glibc) ターゲットで、musl 静的リンクでは
+**ありません**。したがって glibc 2.39 以上（Ubuntu 24.04 以降相当）が必要です。
+
+### mise での導入
+
+[mise](https://mise.jdx.dev/) の GitHub backend で導入できます。
+
+```sh
+# 最新リリース
+mise use -g github:kaminchu/rtl-sdr-ts-stream
+
+# バージョン固定（`@0.1.0` はタグ `v0.1.0` に対応）
+mise use -g github:kaminchu/rtl-sdr-ts-stream@0.1.0
+```
+
+### バージョンの扱い
+
+- リリースビルドでは、ビルド時に環境変数 `TS_STREAM_VERSION` へ push された
+  タグ名が設定され、`ts-stream --version` と `GET /version` はそのタグ名を返し
+  ます（例: タグ `v0.1.0` なら `v0.1.0`）。
+- タグを経由しない通常の `cargo build` では `Cargo.toml` の `version`
+  （`0.1.0`）にフォールバックします。CLI と HTTP は `ts_stream::VERSION` という
+  単一の定数を共有します。
+- `TS_STREAM_GIT` には push されたタグが指すコミット SHA（`git rev-parse HEAD`。
+  annotated tag でもタグオブジェクトではなくコミット）が埋め込まれ、`/version`
+  の `git` フィールドに現れます。
+- ハイフンを含むタグのうち、セマンティックバージョン風の
+  `v?X.Y.Z-...`（例 `v0.1.0-rc.1`、`1.2.3-beta`）だけを GitHub の prerelease
+  として公開します。それ以外のダッシュ入りタグは通常リリースとして公開します。
+
+### 実行時の依存
+
+- アーカイブに `librtlsdr` は**同梱していません**。実行時に `libloading` で
+  `librtlsdr.so.2` → `.so.0` → `.so` の順に `dlopen` します（§6）。
+- RTL-SDR の USB デバイスへアクセスする権限が別途必要です。udev ルールで
+  `plugdev` 等に許可を与えるか root で実行してください（§6）。
+- `librtlsdr` が無くてもサーバは起動し、`/version` に応答します。`/stream`
+  は `503` を返します。
 
 「未測定・未実装の項目を対応済みと宣言しない」を本プロジェクトの文書方針とします。

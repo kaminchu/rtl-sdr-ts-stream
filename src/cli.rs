@@ -17,7 +17,7 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 1_200_000;
 #[derive(Debug, Parser)]
 #[command(
     name = "ts-stream",
-    version,
+    version = crate::VERSION,
     about = "Receive an ISDB-T one-seg channel from an RTL-SDR and stream its TS over HTTP"
 )]
 pub struct Cli {

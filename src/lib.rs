@@ -25,3 +25,14 @@ pub mod fec;
 pub mod http;
 pub mod rtl;
 pub mod session;
+
+/// Version reported by `ts-stream --version` and `GET /version`.
+///
+/// The release workflow compiles with `TS_STREAM_VERSION` set to the pushed git
+/// tag, so released binaries report that tag. Every other build falls back to
+/// the crate version declared in `Cargo.toml`. Keeping this as the single
+/// source of truth prevents the CLI and the HTTP surface from drifting apart.
+pub const VERSION: &str = match option_env!("TS_STREAM_VERSION") {
+    Some(tag) => tag,
+    None => env!("CARGO_PKG_VERSION"),
+};

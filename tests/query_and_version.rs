@@ -108,6 +108,22 @@ async fn valid_query_reaches_the_backend_and_reports_503() {
     assert!(!manager.is_reserved(), "failed start must release the slot");
 }
 
+#[test]
+fn cli_reports_the_library_version() {
+    // The CLI must render the shared `ts_stream::VERSION` (which the release
+    // workflow overrides with the pushed tag) instead of letting clap derive a
+    // version of its own from `Cargo.toml`.
+    use clap::error::ErrorKind;
+    use clap::Parser;
+    let error = ts_stream::cli::Cli::try_parse_from(["ts-stream", "--version"])
+        .expect_err("--version exits with a display error");
+    assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+    assert_eq!(
+        error.to_string().trim_end(),
+        format!("ts-stream {}", ts_stream::VERSION)
+    );
+}
+
 #[tokio::test]
 async fn version_json_is_stable_and_state_independent() {
     let manager = unavailable_manager();
@@ -133,7 +149,7 @@ async fn version_json_is_stable_and_state_independent() {
             .expect("body");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(json["name"], "ts-stream");
-        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["version"], ts_stream::VERSION);
         assert!(
             !manager.is_reserved(),
             "/version must not reserve the stream slot"

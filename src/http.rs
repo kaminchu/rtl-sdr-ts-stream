@@ -56,7 +56,7 @@ impl VersionInfo {
     pub fn current() -> Self {
         Self {
             name: Self::NAME,
-            version: env!("CARGO_PKG_VERSION"),
+            version: crate::VERSION,
             git: option_env!("TS_STREAM_GIT"),
         }
     }

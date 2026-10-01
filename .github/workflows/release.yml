@@ -1,0 +1,120 @@
+name: release
+
+# Every tag push builds native Linux binaries and attaches them to a GitHub
+# release for that tag. There is intentionally no manual trigger: the tag is
+# the release.
+on:
+  push:
+    tags:
+      - '**'
+
+# The default token only needs read access; `publish` elevates itself.
+permissions:
+  contents: read
+
+# Serialize releases that target the same ref without cancelling an in-flight
+# run (a rerun must not interrupt an upload started by an earlier attempt).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both runners are Ubuntu 24.04, so the resulting binaries share the
+          # same glibc 2.39 runtime baseline. `ubuntu-24.04-arm` is a standard
+          # GitHub-hosted arm64 runner for public repositories.
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@v7
+
+      # Pass the tag through the environment instead of interpolating the ref
+      # into the script, and record the commit for annotated tags too.
+      - name: Record tag and commit for the build
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          echo "TS_STREAM_VERSION=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "TS_STREAM_GIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install stable Rust with the target
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked --target "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Smoke test --version
+        run: |
+          expected="ts-stream $TS_STREAM_VERSION"
+          version="$(./target/${{ matrix.target }}/release/ts-stream --version)"
+          printf '%s\n' "$version"
+          if [ "$version" != "$expected" ]; then
+            echo "error: expected '$expected' from --version, got '$version'" >&2
+            exit 1
+          fi
+
+      - name: Package ts-stream-${{ matrix.target }}.tar.gz
+        run: |
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/ts-stream-${{ matrix.target }}.tar.gz" ts-stream
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: ts-stream-${{ matrix.target }}
+          path: dist/ts-stream-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create combined SHA256SUMS
+        run: |
+          cd dist
+          sha256sum ts-stream-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          # Only semver-like tags with a prerelease suffix (`v0.1.0-rc.1`,
+          # `1.2.3-beta`) become GitHub prereleases; other dashed tags stay as
+          # normal releases.
+          extra=()
+          if printf '%s' "$TAG_NAME" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+-'; then
+            extra+=(--prerelease)
+          fi
+          if gh release view -- "$TAG_NAME" >/dev/null 2>&1; then
+            # Rerun of an already-published tag: refresh the assets in place.
+            gh release upload --clobber -- "$TAG_NAME" dist/ts-stream-*.tar.gz dist/SHA256SUMS
+          else
+            gh release create --verify-tag --title "$TAG_NAME" --generate-notes "${extra[@]}" -- \
+              "$TAG_NAME" dist/ts-stream-*.tar.gz dist/SHA256SUMS
+          fi
